@@ -57,9 +57,16 @@ retired after 2 s of silence.
 ## Discovery
 
 Transmitter broadcasts a `DISCOVER` packet (empty payload, header only) to
-`255.255.255.255:45679`. Any server replies with `ANNOUNCE` from its audio
-port, payload = UTF-8 display name. The transmitter takes the source address of
-the reply as the server address. Manual IP entry always overrides this.
+`255.255.255.255:45679` and listens on the ephemeral port it sent from. Any
+server replies with `ANNOUNCE` **from the discovery port**, addressed back to
+the probe's source port; the payload is the UTF-8 display name.
+
+The transmitter takes the source address of the reply as the server address and
+assumes audio goes to the default audio port. Manual entry always overrides
+discovery, and is the fallback on networks that drop broadcast traffic.
+
+Discovery is entirely optional: it never carries audio, and a transmitter given
+an address by hand never sends a `DISCOVER` packet at all.
 
 ## Jitter buffer (receiver side, per ssrc)
 
@@ -70,12 +77,16 @@ audio callback reads.
 * `timestamp` gaps insert silence (concealment) up to 4x target; a larger gap
   is treated as a restart and re-primes.
 * `timestamp` older than the write cursor = late or duplicate, dropped.
-* Reader-side trimming: if fill exceeds `maxFrames` (target x 4) the audio
+* Reader-side trimming: if fill exceeds `maxFill` (target x 4) the audio
   thread discards down to target. This is where accumulated latency from
   clock drift is shed — always by dropping the *oldest* audio.
 * Underrun sets a resync flag; the writer then re-primes with `targetFrames`
   of silence so the buffer returns to its target depth instead of hovering at
   zero and clicking on every callback.
+* A packet that will not fit is dropped whole and the write cursor stays put,
+  so the next packet arrives as a `timestamp` gap and is concealed. This only
+  happens when the reader has stalled, at which point the stale audio in the
+  ring is worthless anyway.
 
 Sender and receiver clocks are independent and will drift (tens of ppm). Over
 a one-hour talk that is a few hundred milliseconds — the trim/re-prime pair
@@ -84,14 +95,14 @@ with resampling.
 
 ## Latency budget (typical, 48 kHz, 5 ms packets)
 
-| Stage                              | ms        |
-|------------------------------------|-----------|
-| Capture (AAudio exclusive, 2 bursts)| 6-10     |
-| Packetisation                       | 5        |
-| Wi-Fi 5 GHz LAN                     | 1-5      |
-| Jitter buffer                       | 15        |
-| Mix + playback (AAudio exclusive)   | 6-12      |
-| **Total**                           | **33-47** |
+| Stage                                | ms        |
+|--------------------------------------|-----------|
+| Capture (AAudio exclusive, 2 bursts) | 6-10      |
+| Packetisation                        | 5         |
+| Wi-Fi 5 GHz LAN                      | 1-5       |
+| Jitter buffer                        | 15        |
+| Mix + playback (AAudio exclusive)    | 6-12      |
+| **Total**                            | **33-47** |
 
 Under ~50 ms is the usable range for live reinforcement; below ~25 ms it stops
 being perceptible as an echo to the person speaking. Wi-Fi is the variable that

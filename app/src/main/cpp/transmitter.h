@@ -52,6 +52,7 @@ public:
 
 private:
     bool openStream(int inputPreset);
+    void closeStream();
     void senderLoop();
     void sendControl(uint8_t type, int repeats);
 

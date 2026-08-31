@@ -8,6 +8,7 @@
 #include <random>
 
 #include "log.h"
+#include "meter.h"
 #include "util.h"
 
 namespace lau {
@@ -46,6 +47,10 @@ bool Transmitter::start(const std::string& host, int port, int framesPerPacket,
     cbScratch_.assign(static_cast<size_t>(kMaxFramesPerPacket) * 4, 0);
     txPacket_.assign(kMaxPacketBytes, 0);
 
+    // Sent before the sender thread exists: seq_/timestamp_ belong to that
+    // thread once it is running, and reading them from here would race.
+    sendControl(kTypeHello, 3);
+
     running_.store(true, std::memory_order_release);
     sender_ = std::thread([this] { senderLoop(); });
 
@@ -57,7 +62,6 @@ bool Transmitter::start(const std::string& host, int port, int framesPerPacket,
         return false;
     }
 
-    sendControl(kTypeHello, 3);
     LAU_LOGI("transmitter started -> %s:%d, %d frames/packet, ssrc=%08x", host_.c_str(),
              port_, framesPerPacket_, ssrc_);
     return true;
@@ -108,24 +112,28 @@ bool Transmitter::openStream(int inputPreset) {
     return true;
 }
 
+void Transmitter::closeStream() {
+    std::shared_ptr<oboe::AudioStream> stream;
+    {
+        std::lock_guard<std::mutex> lock(streamLock_);
+        stream = stream_;
+        stream_.reset();
+    }
+    if (stream) {
+        stream->requestStop();
+        stream->close();
+    }
+}
+
 void Transmitter::stop() {
     if (!running_.exchange(false, std::memory_order_acq_rel)) return;
 
-    {
-        std::shared_ptr<oboe::AudioStream> stream;
-        {
-            std::lock_guard<std::mutex> lock(streamLock_);
-            stream = stream_;
-            stream_.reset();
-        }
-        if (stream) {
-            stream->requestStop();
-            stream->close();
-        }
-    }
-    sendControl(kTypeBye, 3);
+    closeStream();
+    // Join first, then send: BYE reads seq_/timestamp_, which the sender
+    // thread is still advancing until it has actually exited.
     sem_post(&sem_);
     if (sender_.joinable()) sender_.join();
+    sendControl(kTypeBye, 3);
     socket_.close();
     LAU_LOGI("transmitter stopped");
 }
@@ -165,17 +173,12 @@ oboe::DataCallbackResult Transmitter::onAudioReady(oboe::AudioStream* stream,
         }
     }
 
-    float peak = 0.0f;
+    int32_t peak = 0;
     for (size_t i = 0; i < frames; ++i) {
-        const float a = mono[i] < 0 ? -static_cast<float>(mono[i]) : static_cast<float>(mono[i]);
+        const int32_t a = mono[i] < 0 ? -static_cast<int32_t>(mono[i]) : mono[i];
         if (a > peak) peak = a;
     }
-    {
-        uint32_t cur = peakMilli_.load(std::memory_order_relaxed);
-        uint32_t nv  = static_cast<uint32_t>(peak * (1000.0f / 32768.0f));
-        if (nv < cur) nv = cur - (cur >> 4);
-        peakMilli_.store(nv, std::memory_order_relaxed);
-    }
+    updatePeakMeter(peakMilli_, static_cast<float>(peak) * (1.0f / 32768.0f));
 
     const size_t written = ring_.write(mono, frames);
     if (written < frames) {
@@ -245,7 +248,12 @@ void Transmitter::onErrorAfterClose(oboe::AudioStream* /*stream*/, oboe::Result 
     // already closed the stream on its own thread; reopen from a detached one.
     std::thread([this] {
         std::this_thread::sleep_for(std::chrono::milliseconds(200));
-        if (running_.load(std::memory_order_acquire)) openStream(inputPreset_);
+        if (!running_.load(std::memory_order_acquire)) return;
+        if (openStream(inputPreset_) && !running_.load(std::memory_order_acquire)) {
+            // stop() ran while we were reopening and saw no stream to close;
+            // the one we just installed would otherwise hold the mic open.
+            closeStream();
+        }
     }).detach();
 }
 

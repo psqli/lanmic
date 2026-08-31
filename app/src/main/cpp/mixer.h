@@ -10,6 +10,7 @@
 #include <vector>
 
 #include "jitter_buffer.h"
+#include "meter.h"
 
 namespace lau {
 
@@ -17,7 +18,7 @@ inline constexpr int kMaxSources = 8;
 
 struct SourceSnapshot {
     uint32_t ssrc;
-    uint32_t peakMilli;    // 0..1000
+    uint32_t peakMilli;    // 0..kMeterCeiling, 1000 = full scale
     uint32_t bufferFrames;
     uint32_t packets;
     uint32_t lost;
@@ -100,7 +101,7 @@ public:
                 const float a = v < 0 ? -v : v;
                 if (a > peak) peak = a;
             }
-            updatePeak(s, peak);
+            updatePeakMeter(s.peakMilli, peak);
         }
         return active;
     }
@@ -153,15 +154,6 @@ private:
         std::atomic<uint32_t> gainMilli{1000};
         std::atomic<uint32_t> muted{0};
     };
-
-    static void updatePeak(Slot& s, float peak) {
-        // Fast attack, ~300 ms decay so the UI meter is readable.
-        uint32_t cur = s.peakMilli.load(std::memory_order_relaxed);
-        uint32_t nv  = static_cast<uint32_t>(peak * 1000.0f);
-        if (nv > 2000) nv = 2000;
-        if (nv < cur) nv = cur - (cur >> 4);
-        s.peakMilli.store(nv, std::memory_order_relaxed);
-    }
 
     Slot slots_[kMaxSources];
 };

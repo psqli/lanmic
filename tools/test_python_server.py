@@ -92,6 +92,26 @@ def test_source():
     check(u.w - u.r == 360, "re-primed to target")
 
 
+def test_full_buffer():
+    print("full buffer")
+    src = S.Source(9, 240)
+    src.on_packet(0, 0, np.full(120, 1, dtype=np.int16), 120, False)
+    check(src.write_ts == 120, "cursor advances for a stored packet")
+
+    # Fill the ring without ever reading, so the next write has nowhere to go.
+    seq, ts = 1, 120
+    while src.cap - (src.w - src.r) >= 120:
+        src.on_packet(seq, ts, np.full(120, 2, dtype=np.int16), 120, False)
+        seq, ts = seq + 1, ts + 120
+
+    before_w, before_ts = src.w, src.write_ts
+    src.on_packet(seq, ts, np.full(120, 3, dtype=np.int16), 120, False)
+    check(src.w == before_w, "full ring drops the payload")
+    # Leaving write_ts put turns the drop into a timestamp gap that the next
+    # packet conceals, which is what the C++ receiver does.
+    check(src.write_ts == before_ts, "write cursor stays put after a drop")
+
+
 def test_limiter():
     print("limiter")
     lim = S.Limiter()
@@ -194,6 +214,7 @@ def test_discovery():
 
 test_header()
 test_source()
+test_full_buffer()
 test_limiter()
 test_end_to_end()
 test_discovery()

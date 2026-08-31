@@ -16,7 +16,8 @@ laptop can be the mixer instead — usually the better choice when you want to
 feed a real interface or a house console.
 
 Typical end-to-end delay is **33–47 ms**. The wire format and the latency
-budget are in [PROTOCOL.md](PROTOCOL.md).
+budget are in [PROTOCOL.md](PROTOCOL.md); how the code is put together is in
+[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
 ```
   phone (mic)  ─┐
@@ -32,6 +33,7 @@ app/src/main/java/      Kotlin UI, foreground service, discovery
 server/                 desktop mixing server + a test transmitter
 tools/                  host-side tests for the C++ core and the Python server
 PROTOCOL.md             wire format, jitter strategy, latency budget
+docs/ARCHITECTURE.md    module map, threading model, invariants
 ```
 
 ## Build the app
@@ -51,7 +53,7 @@ it is incremental.
 
 No local Android SDK? Push the repo to GitHub and
 `.github/workflows/android.yml` builds `app-debug.apk` for you and uploads it as
-a workflow artifact - it also runs the C++ host tests on every push.
+a workflow artifact - it also runs both test suites on every push.
 
 `minSdk` is 26. AAudio's low-latency MMAP path arrives properly in API 27+; on
 older devices Oboe falls back to OpenSL ES and capture latency roughly doubles.
@@ -141,19 +143,20 @@ for a reason.
 * **Zero-latency limiter.** Instant attack, 150 ms release, no lookahead —
   because lookahead is latency.
 
+The threading model and the invariants behind these choices are written up in
+[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+
 ## Tests
 
 ```bash
-cd tools
-g++ -std=c++17 -O2 -Wall -Wextra -I../app/src/main/cpp \
-    host_test.cpp ../app/src/main/cpp/udp_socket.cpp -o host_test -lpthread
-./host_test                    # protocol, ring, jitter buffer, mixer, UDP loopback
-python3 test_python_server.py  # the desktop server's jitter buffer and mix path
+tools/run_tests.sh              # C++ core + Python server
+tools/run_tests.sh --sanitize   # the same, under ASan/UBSan and TSan
 ```
 
-`host_test` covers the platform-independent half of the engine (everything
-except the Oboe streams) and passes clean under ASan, UBSan and TSan. The two
-implementations are checked against the same wire format.
+`host_test` covers the platform-independent half of the engine — everything
+except the Oboe streams — and passes clean under ASan, UBSan and TSan. The
+Python suite covers the same behaviours in `lan_audio_server.py`, so the two
+implementations stay in step. CI runs both on every push.
 
 ## Limits
 

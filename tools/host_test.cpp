@@ -9,6 +9,7 @@
 #include <vector>
 
 #include "jitter_buffer.h"
+#include "meter.h"
 #include "mixer.h"
 #include "protocol.h"
 #include "spsc_ring.h"
@@ -192,6 +193,36 @@ static void testJitter() {
     CHECK(j6.fill() == kTarget + 120);   // re-primed
 }
 
+static void testMeter() {
+    printf("peak meter ballistics\n");
+    std::atomic<uint32_t> m{0};
+
+    updatePeakMeter(m, 0.8f);
+    CHECK(m.load() == 800);                 // instant attack
+
+    updatePeakMeter(m, 0.9f);
+    CHECK(m.load() == 900);
+
+    updatePeakMeter(m, 0.1f);               // decays rather than snapping down
+    CHECK(m.load() < 900 && m.load() > 100);
+
+    // Silence must actually reach zero. A bare `cur >> 4` decay stalls at 15
+    // and parks every meter at -36 dBFS - 39% of a -60..0 dB bar - forever.
+    for (int i = 0; i < 10000; ++i) updatePeakMeter(m, 0.0f);
+    CHECK(m.load() == 0);
+
+    // Sources and the master bus run up to 2x, so the meter reports overs
+    // instead of pinning at full scale.
+    updatePeakMeter(m, 1.5f);
+    CHECK(m.load() == 1500);
+    updatePeakMeter(m, 99.0f);
+    CHECK(m.load() == kMeterCeiling);
+
+    // Decay from the ceiling still lands on zero.
+    for (int i = 0; i < 100000; ++i) updatePeakMeter(m, 0.0f);
+    CHECK(m.load() == 0);
+}
+
 static void testMixer() {
     printf("mixer + limiter\n");
     SourceTable t;
@@ -361,6 +392,7 @@ int main() {
     testHeader();
     testRing();
     testJitter();
+    testMeter();
     testMixer();
     testUdpLoopback();
     testEndToEnd();

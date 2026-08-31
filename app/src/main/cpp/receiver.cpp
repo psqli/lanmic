@@ -4,6 +4,7 @@
 #include <cstring>
 
 #include "log.h"
+#include "meter.h"
 #include "util.h"
 
 namespace lau {
@@ -14,8 +15,6 @@ constexpr int64_t kSourceTimeoutMs  = 2000;
 }  // namespace
 
 Receiver::~Receiver() { stop(); }
-
-int64_t Receiver::nowMsCached() { return lau::nowMs(); }
 
 bool Receiver::start(int port, int jitterMs) {
     if (running_.load(std::memory_order_acquire)) return true;
@@ -87,20 +86,22 @@ bool Receiver::openStream() {
     return true;
 }
 
+void Receiver::closeStream() {
+    std::shared_ptr<oboe::AudioStream> stream;
+    {
+        std::lock_guard<std::mutex> lock(streamLock_);
+        stream = stream_;
+        stream_.reset();
+    }
+    if (stream) {
+        stream->requestStop();
+        stream->close();
+    }
+}
+
 void Receiver::stop() {
     if (!running_.exchange(false, std::memory_order_acq_rel)) return;
-    {
-        std::shared_ptr<oboe::AudioStream> stream;
-        {
-            std::lock_guard<std::mutex> lock(streamLock_);
-            stream = stream_;
-            stream_.reset();
-        }
-        if (stream) {
-            stream->requestStop();
-            stream->close();
-        }
-    }
+    closeStream();
     if (netThread_.joinable()) netThread_.join();
     socket_.close();
     LAU_LOGI("server stopped");
@@ -137,12 +138,7 @@ oboe::DataCallbackResult Receiver::onAudioReady(oboe::AudioStream* stream, void*
         const float a = mix[i] < 0 ? -mix[i] : mix[i];
         if (a > peak) peak = a;
     }
-    {
-        uint32_t cur = masterPeakMilli_.load(std::memory_order_relaxed);
-        uint32_t nv  = static_cast<uint32_t>(peak * 1000.0f);
-        if (nv < cur) nv = cur - (cur >> 4);
-        masterPeakMilli_.store(nv, std::memory_order_relaxed);
-    }
+    updatePeakMeter(masterPeakMilli_, peak);
 
     if (stream->getFormat() == oboe::AudioFormat::Float) {
         float* out = static_cast<float*>(audioData);
@@ -216,7 +212,11 @@ void Receiver::onErrorAfterClose(oboe::AudioStream* /*stream*/, oboe::Result err
     if (!running_.load(std::memory_order_acquire)) return;
     std::thread([this] {
         std::this_thread::sleep_for(std::chrono::milliseconds(200));
-        if (running_.load(std::memory_order_acquire)) openStream();
+        if (!running_.load(std::memory_order_acquire)) return;
+        if (openStream() && !running_.load(std::memory_order_acquire)) {
+            // stop() ran while we were reopening and saw no stream to close.
+            closeStream();
+        }
     }).detach();
 }
 

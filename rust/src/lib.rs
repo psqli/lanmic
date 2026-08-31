@@ -33,6 +33,7 @@
 //! without a device. Only the two Oboe streams and the JNI surface need a
 //! phone.
 
+pub mod feedback;
 pub mod jitter;
 pub mod meter;
 pub mod mixer;

@@ -249,6 +249,20 @@ pub extern "system" fn Java_com_lanmic_audio_NativeAudio_nativeSetMasterGain(
     }
 }
 
+/// Feedback-suppression depth in Hz on the mix bus; 0 switches it off.
+#[no_mangle]
+pub extern "system" fn Java_com_lanmic_audio_NativeAudio_nativeSetFeedbackShift(
+    _env: JNIEnv,
+    _this: JObject,
+    hz: jfloat,
+) {
+    if let Some(engine) = try_lock(&RX) {
+        if let Some(r) = engine.as_ref() {
+            r.table().set_feedback_shift_hz(hz);
+        }
+    }
+}
+
 #[no_mangle]
 pub extern "system" fn Java_com_lanmic_audio_NativeAudio_nativeSetSourceGain(
     _env: JNIEnv,

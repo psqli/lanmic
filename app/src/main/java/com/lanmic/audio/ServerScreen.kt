@@ -49,6 +49,7 @@ fun ServerScreen(settings: Settings) {
     var port by remember { mutableStateOf(settings.port.toString()) }
     var jitterMs by remember { mutableIntStateOf(settings.jitterMs) }
     var master by remember { mutableFloatStateOf(settings.masterGain) }
+    var feedbackShift by remember { mutableFloatStateOf(settings.feedbackShiftHz) }
     var stats by remember { mutableStateOf(RxStats()) }
     var sources by remember { mutableStateOf<List<SourceInfo>>(emptyList()) }
     var addresses by remember { mutableStateOf<List<String>>(emptyList()) }
@@ -69,9 +70,11 @@ fun ServerScreen(settings: Settings) {
         while (true) {
             val s = NativeAudio.serverStats()
             if (s.running && !wasRunning) {
-                // A fresh engine comes up at unity; the slider was restored
-                // from preferences and has to be pushed back down to match.
+                // A fresh engine comes up at its own defaults; these sliders
+                // were restored from preferences and have to be pushed back
+                // down to match.
                 NativeAudio.setMasterGain(master)
+                NativeAudio.setFeedbackShift(feedbackShift)
             }
             wasRunning = s.running
             stats = s
@@ -132,6 +135,37 @@ fun ServerScreen(settings: Settings) {
             value = master,
             onValueChange = { master = it; NativeAudio.setMasterGain(it); settings.masterGain = it },
             valueRange = 0f..4f
+        )
+    }
+
+    Spacer(Modifier.height(12.dp))
+
+    Panel("Feedback") {
+        Text(
+            if (feedbackShift < 0.05f) {
+                "Suppression  off"
+            } else {
+                "Suppression  ${"%.1f".format(feedbackShift)} Hz shift"
+            },
+            fontSize = 12.sp,
+            color = Palette.TextMuted
+        )
+        Slider(
+            value = feedbackShift,
+            onValueChange = {
+                feedbackShift = it
+                NativeAudio.setFeedbackShift(it)
+                settings.feedbackShiftHz = it
+            },
+            valueRange = 0f..NativeAudio.MAX_FEEDBACK_SHIFT_HZ,
+            steps = 19
+        )
+        Text(
+            "Shifts the whole mix by a few hertz, which stops a howl building " +
+                "between a microphone and the speakers. Raise it if you still " +
+                "ring; drop it to zero for music, where it is audible.",
+            fontSize = 11.sp,
+            color = Palette.TextFaint
         )
     }
 

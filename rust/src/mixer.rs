@@ -10,6 +10,7 @@
 use std::sync::atomic::{AtomicI64, AtomicU32, Ordering};
 use std::sync::Arc;
 
+use crate::feedback::FrequencyShifter;
 use crate::jitter::{self, JitterReader, JitterShared, JitterWriter};
 use crate::meter::{update_peak_meter, METER_CEILING, METER_FULL_SCALE};
 
@@ -21,6 +22,12 @@ pub const MAX_CALLBACK_FRAMES: usize = 8192;
 
 const SLOT_FREE: u32 = 0;
 const SLOT_ACTIVE: u32 = 1;
+
+/// Enough to break the loop, small enough to be inaudible on speech. Every
+/// installed speech system that does this sits in the 3-7 Hz range.
+pub const DEFAULT_FEEDBACK_SHIFT_HZ: f32 = 5.0;
+const DEFAULT_FEEDBACK_SHIFT_HZ_MILLI: u32 = (DEFAULT_FEEDBACK_SHIFT_HZ * 1000.0) as u32;
+pub const MAX_FEEDBACK_SHIFT_HZ: f32 = 10.0;
 
 #[derive(Debug, Default, Clone, Copy)]
 pub struct SourceSnapshot {
@@ -75,6 +82,8 @@ impl Slot {
 pub struct Table {
     slots: [Slot; MAX_SOURCES],
     master_gain_milli: AtomicU32,
+    /// Feedback-suppression shift in millihertz; 0 is off.
+    feedback_shift_milli: AtomicU32,
     master_peak_milli: AtomicU32,
     limiter_gain_milli: AtomicU32,
     active_sources: AtomicU32,
@@ -85,6 +94,7 @@ impl Table {
         Self {
             slots: std::array::from_fn(|_| Slot::new(target_frames)),
             master_gain_milli: AtomicU32::new(METER_FULL_SCALE),
+            feedback_shift_milli: AtomicU32::new(DEFAULT_FEEDBACK_SHIFT_HZ_MILLI),
             master_peak_milli: AtomicU32::new(0),
             limiter_gain_milli: AtomicU32::new(METER_FULL_SCALE),
             active_sources: AtomicU32::new(0),
@@ -98,6 +108,23 @@ impl Table {
             return 0;
         }
         ((gain * METER_FULL_SCALE as f32) as u32).min(METER_CEILING)
+    }
+
+    /// Frequency shift applied to the whole mix to hold off howlround. See
+    /// [`crate::feedback`] for why this is the lever rather than cancellation.
+    /// Zero switches it off.
+    pub fn set_feedback_shift_hz(&self, hz: f32) {
+        let hz = if hz.is_finite() {
+            hz.clamp(0.0, MAX_FEEDBACK_SHIFT_HZ)
+        } else {
+            0.0
+        };
+        self.feedback_shift_milli
+            .store((hz * 1000.0) as u32, Ordering::Relaxed);
+    }
+
+    pub fn feedback_shift_hz(&self) -> f32 {
+        self.feedback_shift_milli.load(Ordering::Relaxed) as f32 / 1000.0
     }
 
     pub fn set_master_gain(&self, gain: f32) {
@@ -184,6 +211,7 @@ pub fn build(target_frames: usize) -> (Arc<Table>, SourceWriter, Mixer) {
         readers: to_array(readers),
         scratch: vec![0i16; MAX_CALLBACK_FRAMES],
         mix: vec![0.0f32; MAX_CALLBACK_FRAMES],
+        shifter: FrequencyShifter::new(crate::protocol::SAMPLE_RATE),
         limiter: Limiter::new(0.98, crate::protocol::SAMPLE_RATE, 150.0),
     };
     (table, writer, mixer)
@@ -274,6 +302,7 @@ pub struct Mixer {
     readers: [JitterReader; MAX_SOURCES],
     scratch: Vec<i16>,
     mix: Vec<f32>,
+    shifter: FrequencyShifter,
     limiter: Limiter,
 }
 
@@ -321,6 +350,14 @@ impl Mixer {
                 *s *= master;
             }
         }
+
+        // Ahead of the limiter, so the ceiling still holds over whatever the
+        // shift does to the waveform's crest.
+        let shift = self.table.feedback_shift_hz();
+        if shift != self.shifter.shift_hz() {
+            self.shifter.set_shift_hz(shift);
+        }
+        self.shifter.process(mix);
 
         self.limiter.process(mix);
         self.table.limiter_gain_milli.store(
@@ -393,6 +430,9 @@ mod tests {
     #[test]
     fn sources_sum_and_respond_to_gain_and_mute() {
         let (table, mut w, mut m) = build(TARGET);
+        // Summing and gain staging, not feedback suppression: the shifter would
+        // rewrite every sample these assertions are about.
+        table.set_feedback_shift_hz(0.0);
         let a = w.acquire(0xAAAA, 0).unwrap();
         let b = w.acquire(0xBBBB, 0).unwrap();
         assert_eq!(w.acquire(0xAAAA, 0), Some(a), "same ssrc, same slot");
@@ -450,7 +490,8 @@ mod tests {
 
     #[test]
     fn a_rejoining_source_does_not_play_the_previous_session() {
-        let (_table, mut w, mut m) = build(240);
+        let (table, mut w, mut m) = build(240);
+        table.set_feedback_shift_hz(0.0);
         let slot = w.acquire(0xC0DE, 0).unwrap();
         feed(&mut w, slot, 9000, 6, 240);
         m.render(240); // the mixer is live on this slot
@@ -496,6 +537,50 @@ mod tests {
         let (_table, mut w, mut m) = build(240);
         w.acquire(1, 0).unwrap();
         assert_eq!(m.render(MAX_CALLBACK_FRAMES + 1).len(), MAX_CALLBACK_FRAMES);
+    }
+
+    #[test]
+    fn feedback_suppression_is_on_by_default_and_reaches_the_bus() {
+        // The default is a working suppression depth, not zero: a fix nobody
+        // finds the slider for is not a fix. It has to survive the trip through
+        // the table's atomics and into the audio thread's shifter.
+        let (table, mut w, mut m) = build(240);
+        assert_eq!(table.feedback_shift_hz(), DEFAULT_FEEDBACK_SHIFT_HZ);
+
+        // Two packets, so this stays under the trim ceiling and the block being
+        // compared is real audio rather than an underrun.
+        let pcm: Vec<i16> = (0..240)
+            .map(|i| ((i as f32 * 0.13).sin() * 16000.0) as i16)
+            .collect();
+        let render_second_block = |table: &Table, w: &mut SourceWriter, m: &mut Mixer, shift| {
+            table.set_feedback_shift_hz(shift);
+            let slot = w.acquire(1, 0).unwrap();
+            for i in 0..2 {
+                w.on_packet(slot, i, i * 240, Some(&pcm), 240, false);
+            }
+            m.render(240); // priming silence
+            m.render(240).to_vec()
+        };
+        let shifted = render_second_block(&table, &mut w, &mut m, DEFAULT_FEEDBACK_SHIFT_HZ);
+
+        let (t2, mut w2, mut m2) = build(240);
+        let plain = render_second_block(&t2, &mut w2, &mut m2, 0.0);
+
+        assert!(
+            plain.iter().any(|s| s.abs() > 0.01),
+            "the reference is silent"
+        );
+
+        assert_ne!(shifted, plain, "the shift never reached the bus");
+        // Same signal, moved - not attenuated, and not made silent.
+        let energy = |v: &[f32]| v.iter().map(|s| s * s).sum::<f32>();
+        let (a, b) = (energy(&shifted), energy(&plain));
+        assert!(a > b * 0.5 && a < b * 2.0, "level changed: {a} vs {b}");
+
+        // And switching it off puts the bus back to untouched audio.
+        table.set_feedback_shift_hz(0.0);
+        m.render(240);
+        assert_eq!(table.feedback_shift_hz(), 0.0);
     }
 
     #[test]

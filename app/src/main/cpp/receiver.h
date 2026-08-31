@@ -37,7 +37,10 @@ public:
     void stop();
     bool isRunning() const { return running_.load(std::memory_order_acquire); }
 
-    void setMasterGain(float g) { masterGain_.store(g, std::memory_order_relaxed); }
+    // Gains arrive from the UI through JNI; clamp rather than trust them.
+    void setMasterGain(float g) {
+        masterGain_.store(g > 0.0f ? (g < 8.0f ? g : 8.0f) : 0.0f, std::memory_order_relaxed);
+    }
     void setSourceGain(uint32_t ssrc, float g) {
         sources_.setGain(ssrc, static_cast<int>(g * 1000.0f));
     }
@@ -53,7 +56,9 @@ public:
     void onErrorAfterClose(oboe::AudioStream* stream, oboe::Result error) override;
 
 private:
-    bool openStream();
+    // `epoch` is the session the caller opened for. openStream refuses to
+    // install a stream whose session has already been torn down.
+    bool openStream(uint32_t epoch);
     void closeStream();
     void networkLoop();
 
@@ -65,6 +70,10 @@ private:
 
     std::thread       netThread_;
     std::atomic<bool> running_{false};
+    // Bumped on every start and stop. An error-recovery reopen that was
+    // sleeping across a stop/start pair sees the change and stands down rather
+    // than installing a second output stream over the live one.
+    std::atomic<uint32_t> streamEpoch_{0};
     int               port_     = kDefaultAudioPort;
     int               jitterMs_ = 15;
 

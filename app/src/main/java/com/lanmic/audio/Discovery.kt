@@ -8,6 +8,8 @@ import kotlinx.coroutines.withContext
 import java.net.DatagramPacket
 import java.net.DatagramSocket
 import java.net.InetAddress
+import java.net.InetSocketAddress
+import java.net.SocketAddress
 import java.net.SocketTimeoutException
 import java.nio.charset.StandardCharsets
 
@@ -96,7 +98,8 @@ object Discovery {
         private val appContext = context.applicationContext
 
         @Volatile private var running = false
-        private var socket: DatagramSocket? = null
+        // Published by the responder thread, closed by whoever calls stop().
+        @Volatile private var socket: DatagramSocket? = null
         private var thread: Thread? = null
         private var multicastLock: WifiManager.MulticastLock? = null
 
@@ -106,7 +109,12 @@ object Discovery {
             acquireMulticastLock()
             thread = Thread({
                 try {
-                    DatagramSocket(NativeAudio.DISCOVERY_PORT).use { sock ->
+                    // Bound by hand so the address can be reused: a responder
+                    // whose stop() timed out may still be holding the port for
+                    // a moment when the next one starts.
+                    DatagramSocket(null as SocketAddress?).use { sock ->
+                        sock.reuseAddress = true
+                        sock.bind(InetSocketAddress(NativeAudio.DISCOVERY_PORT))
                         socket = sock
                         sock.broadcast = true
                         sock.soTimeout = 500
@@ -131,6 +139,9 @@ object Discovery {
                     Log.w(TAG, "responder stopped: ${e.message}")
                 } finally {
                     socket = null
+                    // Clearing this here too, not just in stop(), keeps a start
+                    // that failed to bind from locking out every later one.
+                    running = false
                 }
             }, "lau-discovery").also { it.isDaemon = true; it.start() }
         }

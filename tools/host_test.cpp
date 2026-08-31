@@ -1,6 +1,7 @@
 // Host-side test for the platform-independent half of the audio core.
 //   g++ -std=c++17 -O2 -Wall -Wextra -I../app/src/main/cpp
 //       host_test.cpp ../app/src/main/cpp/udp_socket.cpp -o host_test -lpthread
+#include <atomic>
 #include <cassert>
 #include <cmath>
 #include <cstdio>
@@ -83,6 +84,18 @@ static void testRing() {
     CHECK(r.size() == 1000);
     CHECK(r.read(out.data(), 700) == 700);
     CHECK(out[0] == 24);
+
+    // skipTo: absolute, idempotent, and never runs past the write cursor
+    SpscRing<int16_t> s2;
+    s2.init(1024);
+    CHECK(s2.write(in.data(), 500) == 500);
+    const uint64_t mark = s2.writeCursor();
+    CHECK(s2.write(in.data(), 200) == 200);
+    CHECK(s2.skipTo(mark) == 500);          // drops everything before the mark
+    CHECK(s2.size() == 200);
+    CHECK(s2.skipTo(mark) == 0);            // replaying it changes nothing
+    CHECK(s2.skipTo(mark + 100000) == 200); // clamped to what was written
+    CHECK(s2.size() == 0);
 
     // producer/consumer under contention
     SpscRing<int16_t> c;
@@ -191,6 +204,52 @@ static void testJitter() {
     CHECK(out[0] == 0);
     feed(j6, 1, 120, 4, 120);
     CHECK(j6.fill() == kTarget + 120);   // re-primed
+
+    // A restart-sized timestamp jump primes back up to target rather than
+    // stacking another target of silence on a buffer that is already deep -
+    // that latency would then sit there until the trim ceiling was crossed.
+    JitterBuffer j7;
+    j7.configure(static_cast<int>(kTarget));
+    for (uint32_t i = 0; i < 8; ++i) feed(j7, i, i * 120, 3, 120);
+    CHECK(j7.fill() == kTarget + 8 * 120);
+    feed(j7, 8, 5000000, 4, 120);        // far beyond maxGap: sender restarted
+    CHECK(j7.fill() == kTarget + 9 * 120);
+}
+
+// resetState() runs on the network thread while the audio callback is reading.
+// It must not rewind the ring cursors: the reader owns one of them, and a
+// writer that moves it leaves the two crossed over and the buffer permanently
+// reporting a depth larger than it can physically hold.
+static void testResetUnderReader() {
+    printf("reset under a live reader\n");
+    JitterBuffer jb;
+    jb.configure(240);
+    const size_t kCap = 4096;   // max(240 * 8, 4096)
+
+    std::atomic<bool> stop{false};
+    std::atomic<int>  bogus{0};
+    std::thread reader([&] {
+        int16_t out[120];
+        while (!stop.load(std::memory_order_relaxed)) {
+            jb.read(out, 120);
+            if (jb.fill() > kCap) bogus.fetch_add(1);
+            if (jb.stats().fillFrames > kCap) bogus.fetch_add(1);
+        }
+    });
+
+    std::vector<int16_t> pcm(120, 777);
+    uint32_t ts = 0;
+    for (int i = 0; i < 5000; ++i) {
+        jb.onPacket(static_cast<uint32_t>(i), ts, pcm.data(), 120, false);
+        ts += 120;
+        if (i % 50 == 0) {   // the same microphone leaving and rejoining
+            jb.resetState();
+            ts = 0;
+        }
+    }
+    stop.store(true, std::memory_order_relaxed);
+    reader.join();
+    CHECK(bogus.load() == 0);
 }
 
 static void testMeter() {
@@ -269,6 +328,30 @@ static void testMixer() {
 
     t.reapStale(5000, 2000);
     CHECK(t.snapshot(snaps, kMaxSources, 5000) == 0);
+
+    // A microphone that says BYE and comes straight back gets a clean buffer:
+    // none of the previous session's audio is left to play out in front of it.
+    SourceTable re;
+    re.configure(240);
+    JitterBuffer* first = re.acquire(0xC0DE, 0);
+    std::vector<int16_t> loud(240, 9000);
+    for (uint32_t i = 0; i < 6; ++i) first->onPacket(i, i * 240, loud.data(), 240, false);
+    std::vector<float>   rmix(240);
+    std::vector<int16_t> rscratch(240);
+    re.mix(rmix.data(), 240, rscratch.data());   // reader is live on this slot
+
+    re.retire(0xC0DE);
+    JitterBuffer* again = re.acquire(0xC0DE, 0);
+    CHECK(again != nullptr);
+    CHECK(again->fill() == 0);
+
+    std::vector<int16_t> fresh(240, 1234);
+    again->onPacket(0, 0, fresh.data(), 240, false);
+    CHECK(again->fill() == 480);                 // target of silence + the packet
+    re.mix(rmix.data(), 240, rscratch.data());
+    CHECK(std::fabs(rmix[0]) < 1e-6f);           // priming silence, not the old 9000s
+    re.mix(rmix.data(), 240, rscratch.data());
+    CHECK(std::fabs(rmix[0] - 1234.0f / 32768.0f) < 1e-4f);
 
     // table full -> refuse rather than corrupt
     SourceTable full;
@@ -392,6 +475,7 @@ int main() {
     testHeader();
     testRing();
     testJitter();
+    testResetUnderReader();
     testMeter();
     testMixer();
     testUdpLoopback();

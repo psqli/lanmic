@@ -13,7 +13,10 @@ namespace lau {
 template <typename T>
 class SpscRing {
 public:
-    // capacity is rounded up to a power of two.
+    // capacity is rounded up to a power of two. This is the only way to rewind
+    // the cursors, and it is safe only before either thread is running: there
+    // is deliberately no runtime reset, because a producer-side one would move
+    // the consumer's cursor out from under it. Use skipTo() instead.
     void init(size_t capacity) {
         size_t cap = 1;
         while (cap < capacity) cap <<= 1;
@@ -25,13 +28,22 @@ public:
 
     size_t capacity() const { return buf_.size(); }
 
-    // Readable elements.
+    // Readable elements. Exact on either owning thread; on any third thread
+    // (the UI polling for stats) w_ and r_ are read one after the other and the
+    // consumer can overtake the sampled w_ in between, so clamp rather than let
+    // the unsigned subtraction wrap into a nonsense depth.
     size_t size() const {
-        return static_cast<size_t>(w_.load(std::memory_order_acquire) -
-                                   r_.load(std::memory_order_acquire));
+        const uint64_t w = w_.load(std::memory_order_acquire);
+        const uint64_t r = r_.load(std::memory_order_acquire);
+        return w > r ? static_cast<size_t>(w - r) : 0;
     }
 
     size_t space() const { return capacity() - size(); }
+
+    // Absolute stream positions. Both counters are 64-bit and monotonic, so a
+    // position stays meaningful for the life of the ring.
+    uint64_t writeCursor() const { return w_.load(std::memory_order_acquire); }
+    uint64_t readCursor() const { return r_.load(std::memory_order_acquire); }
 
     // ---- producer side ----
 
@@ -89,10 +101,17 @@ public:
         return n;
     }
 
-    // Only safe while neither thread is running.
-    void clear() {
-        w_.store(0, std::memory_order_relaxed);
-        r_.store(0, std::memory_order_relaxed);
+    // Discard everything written before absolute position `pos`. Consumer side
+    // only. Idempotent and monotonic: replaying an old `pos` is a no-op, so the
+    // producer can publish one and never has to hear back.
+    size_t skipTo(uint64_t pos) {
+        const uint64_t r = r_.load(std::memory_order_relaxed);
+        if (pos <= r) return 0;
+        const uint64_t w = w_.load(std::memory_order_acquire);
+        const uint64_t to = pos < w ? pos : w;
+        if (to <= r) return 0;
+        r_.store(to, std::memory_order_release);
+        return static_cast<size_t>(to - r);
     }
 
 private:

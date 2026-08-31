@@ -18,3 +18,10 @@ fun localIpv4Addresses(): List<String> = try {
 } catch (e: Exception) {
     emptyList()
 }
+
+/**
+ * Parses a UDP port, rejecting anything outside 1..65535. Without the range
+ * check a five-digit entry like 70000 survives all the way to the C++ socket
+ * layer, where the cast to a 16-bit port silently turns it into 4464.
+ */
+fun String.toPortOrNull(): Int? = toIntOrNull()?.takeIf { it in 1..65535 }

@@ -34,8 +34,11 @@ public:
         resetState();
     }
 
+    // Safe to call from the network thread while the audio callback is mixing:
+    // the ring is not rewound (that would race the reader's cursor), the stale
+    // audio is marked for the reader to drop on its next pass instead.
     void resetState() {
-        ring_.clear();
+        dropBefore_.store(ring_.writeCursor(), std::memory_order_release);
         primed_      = false;
         writeTs_     = 0;
         expectedSeq_ = 0;
@@ -93,6 +96,9 @@ public:
     // ---- audio thread ----
     // Always fills exactly `frames` samples (zero-padded on underrun).
     void read(int16_t* dst, size_t frames) {
+        const uint64_t drop = dropBefore_.load(std::memory_order_acquire);
+        if (drop != 0) ring_.skipTo(drop);
+
         size_t avail = ring_.size();
         if (avail > maxFill_) {
             ring_.skip(avail - target_);
@@ -106,7 +112,15 @@ public:
         }
     }
 
-    size_t fill() const { return ring_.size(); }
+    // Playable depth: what the reader will hand to the mixer, which excludes
+    // audio already marked stale by resetState() and not yet dropped.
+    size_t fill() const {
+        const uint64_t drop = dropBefore_.load(std::memory_order_acquire);
+        const uint64_t r    = ring_.readCursor();
+        const uint64_t base = r > drop ? r : drop;
+        const uint64_t w    = ring_.writeCursor();
+        return w > base ? static_cast<size_t>(w - base) : 0;
+    }
     size_t target() const { return target_; }
 
     JitterStats stats() const {
@@ -118,13 +132,22 @@ public:
         s.underruns  = underruns_.load(std::memory_order_relaxed);
         s.trims      = trims_.load(std::memory_order_relaxed);
         s.resyncs    = resyncs_.load(std::memory_order_relaxed);
-        s.fillFrames = static_cast<uint32_t>(ring_.size());
+        s.fillFrames = static_cast<uint32_t>(fill());
         return s;
     }
 
 private:
+    // Bring the buffer up to `target_` frames of depth. Only what the reader
+    // will actually play counts: audio already marked for dropping is not
+    // depth. Topping up rather than always appending `target_` keeps a
+    // re-prime from stacking another target on a buffer that is already deep.
     void prime(uint32_t timestamp) {
-        ring_.writeZeros(target_);
+        const uint64_t drop = dropBefore_.load(std::memory_order_relaxed);
+        const uint64_t r    = ring_.readCursor();
+        const uint64_t base = r > drop ? r : drop;
+        const uint64_t w    = ring_.writeCursor();
+        const size_t   have = w > base ? static_cast<size_t>(w - base) : 0;
+        if (have < target_) ring_.writeZeros(target_ - have);
         writeTs_ = timestamp;
         primed_  = true;
         resyncs_.fetch_add(1, std::memory_order_relaxed);
@@ -141,6 +164,9 @@ private:
     uint32_t writeTs_     = 0;
     uint32_t expectedSeq_ = 0;
 
+    // Published by the network thread, consumed by the audio thread: everything
+    // written before this absolute position is stale and must not be played.
+    std::atomic<uint64_t> dropBefore_{0};
     std::atomic<bool>     resync_{false};
     std::atomic<uint32_t> packets_{0}, lost_{0}, late_{0}, concealed_{0};
     std::atomic<uint32_t> underruns_{0}, trims_{0}, resyncs_{0};

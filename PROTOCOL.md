@@ -49,6 +49,12 @@ All multi-byte fields little-endian.
 * **timestamp** — index of the first frame in the packet within the sender's
   capture stream. This, not arrival time, is what the jitter buffer aligns on.
 
+If the sender's own capture ring overflows — the network thread fell far enough
+behind that captured audio had nowhere to go — the lost frames are added to the
+next packet's `timestamp`. The hole then reaches the receiver as an ordinary gap
+to conceal, instead of two unrelated instants spliced together with the stream
+silently running early from then on.
+
 `HELLO` is sent 3x at start and `BYE` 3x at stop, both with an empty payload —
 purely so the server can light up / drop a channel promptly. Neither is
 required for correctness; a source appears on its first AUDIO packet and is
@@ -73,16 +79,21 @@ an address by hand never sends a `DISCOVER` packet at all.
 Each source owns an SPSC ring of int16 frames. The network thread writes, the
 audio callback reads.
 
-* First packet primes the ring with `targetFrames` of silence (default 15 ms).
+* First packet primes the ring to `targetFrames` of depth (default 15 ms).
+  Priming tops up to the target rather than always appending it, so a re-prime
+  on a buffer that is already deep does not stack more latency onto it.
 * `timestamp` gaps insert silence (concealment) up to 4x target; a larger gap
   is treated as a restart and re-primes.
 * `timestamp` older than the write cursor = late or duplicate, dropped.
 * Reader-side trimming: if fill exceeds `maxFill` (target x 4) the audio
   thread discards down to target. This is where accumulated latency from
   clock drift is shed — always by dropping the *oldest* audio.
-* Underrun sets a resync flag; the writer then re-primes with `targetFrames`
-  of silence so the buffer returns to its target depth instead of hovering at
-  zero and clicking on every callback.
+* Underrun sets a resync flag; the writer then re-primes so the buffer returns
+  to its target depth instead of hovering at zero and clicking on every
+  callback.
+* A source rejoining reuses its slot but not its audio. The writer publishes an
+  absolute "drop everything before here" position rather than rewinding the
+  ring, because the read cursor belongs to the audio thread.
 * A packet that will not fit is dropped whole and the write cursor stays put,
   so the next packet arrives as a `timestamp` gap and is concealed. This only
   happens when the reader has stalled, at which point the stale audio in the

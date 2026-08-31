@@ -16,6 +16,7 @@ import android.os.Looper
 import android.os.PowerManager
 import android.util.Log
 import java.util.concurrent.Executors
+import java.util.concurrent.atomic.AtomicInteger
 
 /**
  * Keeps the engine alive with the screen off and holds the Wi-Fi radio in a
@@ -39,9 +40,6 @@ class AudioService : Service() {
         private const val CHANNEL_ID = "lanmic"
         private const val NOTIF_ID = 42
         private const val TAG = "lanmic-svc"
-
-        @Volatile var mode: String = "idle"
-            private set
 
         fun startTransmitter(
             ctx: Context, host: String, port: Int, packetFrames: Int, inputPreset: Int
@@ -73,13 +71,21 @@ class AudioService : Service() {
         }
     }
 
-    // Opening an AAudio stream takes tens of milliseconds; never do it on the
-    // main thread from onStartCommand.
+    // Opening an AAudio stream takes tens of milliseconds and closing one, plus
+    // joining the network threads, takes longer still. Every engine and lock
+    // operation therefore runs on this one executor - which also means the
+    // fields below are touched by exactly one thread and need no locking of
+    // their own. Nothing here may be called from the main thread.
     private val worker = Executors.newSingleThreadExecutor()
     private val main = Handler(Looper.getMainLooper())
     private var wifiLock: WifiManager.WifiLock? = null
     private var wakeLock: PowerManager.WakeLock? = null
     private var responder: Discovery.Responder? = null
+
+    // Bumped on every start and every stop. A start that was still queued when
+    // the stop arrived sees the change and abandons itself, instead of bringing
+    // the engine up again behind a service that is already going away.
+    private val generation = AtomicInteger(0)
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -96,15 +102,8 @@ class AudioService : Service() {
                 val frames = intent.getIntExtra(EXTRA_PACKET_FRAMES, 240)
                 val preset = intent.getIntExtra(EXTRA_INPUT_PRESET, 0)
                 goForeground("Transmitting to $host:$port", microphone = true)
-                acquireLocks()
-                worker.execute {
-                    if (NativeAudio.startTransmitter(host, port, frames, preset)) {
-                        mode = "tx"
-                    } else {
-                        Log.e(TAG, "transmitter failed to start")
-                        stopEverything()
-                    }
-                }
+                val gen = generation.incrementAndGet()
+                worker.execute { startTx(gen, host, port, frames, preset) }
             }
 
             ACTION_START_SERVER -> {
@@ -112,16 +111,8 @@ class AudioService : Service() {
                 val jitter = intent.getIntExtra(EXTRA_JITTER_MS, 15)
                 val name = intent.getStringExtra(EXTRA_SERVER_NAME) ?: Build.MODEL
                 goForeground("Mixing on udp/$port", microphone = false)
-                acquireLocks()
-                worker.execute {
-                    if (NativeAudio.startServer(port, jitter)) {
-                        mode = "server"
-                        responder = Discovery.Responder(this, name).also { it.start() }
-                    } else {
-                        Log.e(TAG, "server failed to start")
-                        stopEverything()
-                    }
-                }
+                val gen = generation.incrementAndGet()
+                worker.execute { startServer(gen, port, jitter, name) }
             }
 
             ACTION_STOP -> stopEverything()
@@ -130,29 +121,62 @@ class AudioService : Service() {
     }
 
     override fun onDestroy() {
-        stopEngines()
+        // Deliberately does not tear the engine down inline: closing the audio
+        // streams and joining the network and discovery threads can take the
+        // better part of a second, and this runs on the main thread.
+        generation.incrementAndGet()
+        worker.execute { stopEngines() }
         worker.shutdown()
         super.onDestroy()
     }
 
     /** Tears the engine down off the main thread, then retires the service. */
     private fun stopEverything() {
-        mode = "idle"
+        generation.incrementAndGet()
+        worker.execute { stopEngines() }
         main.post {
             stopForeground(STOP_FOREGROUND_REMOVE)
             stopSelf()
         }
-        worker.execute { stopEngines() }
     }
 
-    @Synchronized
+    // ---- worker thread only ----
+
+    private fun startTx(gen: Int, host: String, port: Int, frames: Int, preset: Int) {
+        if (gen != generation.get()) return
+        acquireLocks()
+        if (NativeAudio.startTransmitter(host, port, frames, preset)) {
+            // A stop that arrived while the stream was opening has to win, or
+            // the microphone stays live under a notification that is gone.
+            if (gen != generation.get()) stopEngines()
+            return
+        }
+        Log.e(TAG, "transmitter failed to start")
+        stopEverything()
+    }
+
+    private fun startServer(gen: Int, port: Int, jitter: Int, name: String) {
+        if (gen != generation.get()) return
+        acquireLocks()
+        if (!NativeAudio.startServer(port, jitter)) {
+            Log.e(TAG, "server failed to start")
+            stopEverything()
+            return
+        }
+        if (gen != generation.get()) {
+            stopEngines()
+            return
+        }
+        responder = Discovery.Responder(this, name).also { it.start() }
+        if (gen != generation.get()) stopEngines()
+    }
+
     private fun stopEngines() {
         responder?.stop()
         responder = null
         NativeAudio.stopTransmitter()
         NativeAudio.stopServer()
         releaseLocks()
-        mode = "idle"
     }
 
     private fun goForeground(text: String, microphone: Boolean) {

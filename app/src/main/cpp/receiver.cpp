@@ -19,6 +19,10 @@ Receiver::~Receiver() { stop(); }
 bool Receiver::start(int port, int jitterMs) {
     if (running_.load(std::memory_order_acquire)) return true;
 
+    if (port < 1 || port > 65535) {
+        LAU_LOGE("refusing to listen on port %d: outside 1..65535", port);
+        return false;
+    }
     if (jitterMs < 5) jitterMs = 5;
     if (jitterMs > 200) jitterMs = 200;
     port_     = port;
@@ -31,12 +35,19 @@ bool Receiver::start(int port, int jitterMs) {
     mixBuf_.assign(kMaxCallbackFrames, 0.0f);
     srcBuf_.assign(kMaxCallbackFrames, 0);
 
+    packets_.store(0, std::memory_order_relaxed);
+    badPackets_.store(0, std::memory_order_relaxed);
+    activeSources_.store(0, std::memory_order_relaxed);
+    masterPeakMilli_.store(0, std::memory_order_relaxed);
+    limiterGainMilli_.store(1000, std::memory_order_relaxed);
+
     if (!socket_.openReceiver(static_cast<uint16_t>(port_), 200)) return false;
 
+    const uint32_t epoch = streamEpoch_.fetch_add(1, std::memory_order_acq_rel) + 1;
     running_.store(true, std::memory_order_release);
     netThread_ = std::thread([this] { networkLoop(); });
 
-    if (!openStream()) {
+    if (!openStream(epoch)) {
         running_.store(false, std::memory_order_release);
         if (netThread_.joinable()) netThread_.join();
         socket_.close();
@@ -46,7 +57,7 @@ bool Receiver::start(int port, int jitterMs) {
     return true;
 }
 
-bool Receiver::openStream() {
+bool Receiver::openStream(uint32_t epoch) {
     oboe::AudioStreamBuilder b;
     b.setDirection(oboe::Direction::Output)
         ->setPerformanceMode(oboe::PerformanceMode::LowLatency)
@@ -79,11 +90,21 @@ bool Receiver::openStream() {
     LAU_LOGI("output stream: rate=%d ch=%d fmt=%d burst=%d", stream->getSampleRate(),
              stream->getChannelCount(), static_cast<int>(stream->getFormat()),
              stream->getFramesPerBurst());
+    // Install only if this session is still the current one. Checked under the
+    // same lock stop() closes through, so a stream can never be installed after
+    // the teardown that was meant to catch it.
     {
         std::lock_guard<std::mutex> lock(streamLock_);
-        stream_ = stream;
+        if (streamEpoch_.load(std::memory_order_acquire) == epoch &&
+            running_.load(std::memory_order_acquire)) {
+            stream_ = stream;
+            return true;
+        }
     }
-    return true;
+    LAU_LOGW("output stream superseded while opening - discarding it");
+    stream->requestStop();
+    stream->close();
+    return false;
 }
 
 void Receiver::closeStream() {
@@ -101,6 +122,7 @@ void Receiver::closeStream() {
 
 void Receiver::stop() {
     if (!running_.exchange(false, std::memory_order_acq_rel)) return;
+    streamEpoch_.fetch_add(1, std::memory_order_acq_rel);
     closeStream();
     if (netThread_.joinable()) netThread_.join();
     socket_.close();
@@ -210,13 +232,23 @@ void Receiver::networkLoop() {
 void Receiver::onErrorAfterClose(oboe::AudioStream* /*stream*/, oboe::Result error) {
     LAU_LOGW("output stream error: %s - reopening", oboe::convertToText(error));
     if (!running_.load(std::memory_order_acquire)) return;
-    std::thread([this] {
-        std::this_thread::sleep_for(std::chrono::milliseconds(200));
-        if (!running_.load(std::memory_order_acquire)) return;
-        if (openStream() && !running_.load(std::memory_order_acquire)) {
-            // stop() ran while we were reopening and saw no stream to close.
-            closeStream();
+    // Oboe has already closed the stream on its own thread; reopen from a
+    // detached one. Retry with backoff: the device that took the route away
+    // (a headset arriving, a call ending) is often still busy on the first try,
+    // and giving up once leaves the server running with nothing coming out.
+    const uint32_t epoch = streamEpoch_.load(std::memory_order_acquire);
+    std::thread([this, epoch] {
+        int delayMs = 200;
+        for (int attempt = 0; attempt < 5; ++attempt) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(delayMs));
+            if (!running_.load(std::memory_order_acquire) ||
+                streamEpoch_.load(std::memory_order_acquire) != epoch) {
+                return;  // stopped, or a newer session owns the device now
+            }
+            if (openStream(epoch)) return;
+            delayMs *= 2;
         }
+        LAU_LOGE("output stream did not come back after 5 attempts");
     }).detach();
 }
 

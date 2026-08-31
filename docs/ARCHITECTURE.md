@@ -77,11 +77,24 @@ Six threads matter. Nothing else may touch the marked structures.
 | Oboe output callback | Every `JitterBuffer` read side, `mixBuf_`, `srcBuf_`, `Limiter` | Syscalls, allocation, locks |
 | Network (mixer) | Every `JitterBuffer` write side, slot lifecycle | Blocking on the audio thread |
 | Discovery | Its own socket | Anything on the audio path |
+| Service worker | `AudioService` locks, responder, engine start/stop | Nothing - but it is the *only* thread allowed to do them |
 | UI / JNI | Reads counters through relaxed atomics | Blocking (stat calls use `try_lock`) |
 
 The audio callback and its partner thread meet **only** inside an `SpscRing`.
 Counters cross as relaxed atomics: a torn read of a statistic costs a wrong
 number on screen for 80 ms, and a lock there would cost a dropout.
+
+### Why `AudioService` does everything on one worker
+
+Starting an engine opens an AAudio stream; stopping one closes it, joins the
+network thread and joins the discovery thread. Together that is comfortably
+into ANR territory, so none of it may run on the main thread - including from
+`onDestroy`, which is where it is easiest to get wrong. Every engine and lock
+operation is queued to a single-threaded executor, which also makes those
+fields single-threaded and removes the need to lock them. Ordering between a
+start and the stop that overtakes it is settled by a generation counter: a
+start whose generation is stale abandons itself, and one that finishes after a
+stop tears its own engine back down.
 
 ### Why the stat calls use `try_lock`
 
@@ -111,6 +124,15 @@ clicks, not a crash.
    ninth microphone is refused, not accommodated.
 6. **Sources are identified by `ssrc`, not by address**, so a phone roaming
    between APs keeps its channel strip.
+7. **The producer never moves the consumer's cursor.** A source rejoining
+   cannot rewind the ring under a live audio callback; it publishes an absolute
+   "drop everything before here" position and the reader acts on it. Crossed
+   cursors are not a transient glitch - they make the ring report a depth
+   larger than it can hold, for good.
+8. **One audio stream per session.** Starting and stopping bump an epoch, and a
+   reopen that was sleeping across a stop/start pair stands down instead of
+   installing a second stream over the live one. Two input streams would be two
+   producers on a single-producer ring.
 
 ## Testing
 
@@ -133,20 +155,13 @@ memory ordering claims.
 
 Real, understood, and deliberately not fixed.
 
-* **Slot reuse is racy under a fast leave/join.** If a source is retired and a
-  different one claims its slot inside a single audio callback, that callback
-  can read a jitter buffer that the network thread is concurrently resetting.
-  The ring's cursor arithmetic is masked, so the result is at worst one block
-  of wrong audio — not a crash or an out-of-bounds read. Fixing it properly
-  needs a retiring state with a handshake between the two threads.
-* **A device change during stop can leave a stream open.** The Oboe error
-  callback reopens the stream from a detached thread; `stop()` racing with that
-  reopen is handled by re-checking afterwards and closing, which narrows the
-  window but does not close it.
 * **No encryption, no authentication.** Anyone on the LAN can send audio to a
   mixer, and `ssrc` is self-assigned. This is a private-AP design.
-* **The Python limiter ramps gain across a block** rather than per sample like
-  the C++ one, so a very fast transient can exceed the ceiling by a hair
-  before the next block catches it.
+* **The Python limiter still works a block at a time**, not per sample like the
+  C++ one. Attack is applied flat across the whole block so the ceiling holds,
+  but the gain reduction from a transient is spread over the samples in front
+  of it rather than starting exactly at the peak.
+* **Clock drift is shed, not tracked.** The trim drops the oldest audio every
+  few minutes instead of resampling to the receiver's clock.
 * **No acoustic echo cancellation**, and none is wanted: this is
   reinforcement, not conferencing.

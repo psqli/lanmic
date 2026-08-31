@@ -13,6 +13,12 @@
 
 namespace lau {
 
+namespace {
+// Largest input burst the callback will handle without allocating. 8192 frames
+// is 170 ms at 48 kHz - orders of magnitude above any low-latency burst size.
+constexpr size_t kMaxCallbackFrames = 8192;
+}  // namespace
+
 Transmitter::Transmitter() {
     sem_init(&sem_, 0, 0);
 }
@@ -26,6 +32,10 @@ bool Transmitter::start(const std::string& host, int port, int framesPerPacket,
                         int inputPreset) {
     if (running_.load(std::memory_order_acquire)) return true;
 
+    if (port < 1 || port > 65535) {
+        LAU_LOGE("refusing to send to port %d: outside 1..65535", port);
+        return false;
+    }
     if (framesPerPacket < 60) framesPerPacket = 60;
     if (framesPerPacket > kMaxFramesPerPacket) framesPerPacket = kMaxFramesPerPacket;
 
@@ -39,22 +49,35 @@ bool Transmitter::start(const std::string& host, int port, int framesPerPacket,
     seq_       = 0;
     timestamp_ = 0;
 
+    // A session starts unmuted and with clean counters. Without this a mute
+    // left over from the previous session survives into the new one while the
+    // UI, whose own state did reset, shows the microphone as live.
+    muted_.store(false, std::memory_order_relaxed);
+    peakMilli_.store(0, std::memory_order_relaxed);
+    packetsSent_.store(0, std::memory_order_relaxed);
+    framesDropped_.store(0, std::memory_order_relaxed);
+    sendErrors_.store(0, std::memory_order_relaxed);
+    pendingGap_.store(0, std::memory_order_relaxed);
+
     if (!socket_.openSender(host_, static_cast<uint16_t>(port_))) return false;
 
     // Half a second of headroom is plenty; if we ever fill it the network is
     // gone and stale audio is worthless anyway.
     ring_.init(static_cast<size_t>(kSampleRate / 2));
-    cbScratch_.assign(static_cast<size_t>(kMaxFramesPerPacket) * 4, 0);
+    // Sized for any burst a low-latency input stream can plausibly hand us;
+    // the callback drops a larger one rather than allocating (see onAudioReady).
+    cbScratch_.assign(kMaxCallbackFrames, 0);
     txPacket_.assign(kMaxPacketBytes, 0);
 
     // Sent before the sender thread exists: seq_/timestamp_ belong to that
     // thread once it is running, and reading them from here would race.
     sendControl(kTypeHello, 3);
 
+    const uint32_t epoch = streamEpoch_.fetch_add(1, std::memory_order_acq_rel) + 1;
     running_.store(true, std::memory_order_release);
     sender_ = std::thread([this] { senderLoop(); });
 
-    if (!openStream(inputPreset)) {
+    if (!openStream(inputPreset, epoch)) {
         running_.store(false, std::memory_order_release);
         sem_post(&sem_);
         if (sender_.joinable()) sender_.join();
@@ -67,7 +90,7 @@ bool Transmitter::start(const std::string& host, int port, int framesPerPacket,
     return true;
 }
 
-bool Transmitter::openStream(int inputPreset) {
+bool Transmitter::openStream(int inputPreset, uint32_t epoch) {
     oboe::InputPreset preset = oboe::InputPreset::VoicePerformance;
     if (inputPreset == 1) preset = oboe::InputPreset::Unprocessed;
     else if (inputPreset == 2) preset = oboe::InputPreset::VoiceRecognition;
@@ -105,11 +128,20 @@ bool Transmitter::openStream(int inputPreset) {
     LAU_LOGI("input stream: rate=%d ch=%d fmt=%d burst=%d", stream->getSampleRate(),
              stream->getChannelCount(), static_cast<int>(stream->getFormat()),
              stream->getFramesPerBurst());
+    // Install only if this session is still the current one. Two live input
+    // streams would both feed the ring, and the ring has exactly one producer.
     {
         std::lock_guard<std::mutex> lock(streamLock_);
-        stream_ = stream;
+        if (streamEpoch_.load(std::memory_order_acquire) == epoch &&
+            running_.load(std::memory_order_acquire)) {
+            stream_ = stream;
+            return true;
+        }
     }
-    return true;
+    LAU_LOGW("input stream superseded while opening - discarding it");
+    stream->requestStop();
+    stream->close();
+    return false;
 }
 
 void Transmitter::closeStream() {
@@ -128,6 +160,7 @@ void Transmitter::closeStream() {
 void Transmitter::stop() {
     if (!running_.exchange(false, std::memory_order_acq_rel)) return;
 
+    streamEpoch_.fetch_add(1, std::memory_order_acq_rel);
     closeStream();
     // Join first, then send: BYE reads seq_/timestamp_, which the sender
     // thread is still advancing until it has actually exited.
@@ -144,7 +177,13 @@ oboe::DataCallbackResult Transmitter::onAudioReady(oboe::AudioStream* stream,
     const size_t frames = static_cast<size_t>(numFrames);
     if (frames == 0) return oboe::DataCallbackResult::Continue;
 
-    if (cbScratch_.size() < frames) cbScratch_.assign(frames * 2, 0);
+    if (frames > cbScratch_.size()) {
+        // Should never happen; drop the burst rather than allocate on the audio
+        // thread, which is what the equivalent path in the receiver does.
+        framesDropped_.fetch_add(frames, std::memory_order_relaxed);
+        pendingGap_.fetch_add(static_cast<uint32_t>(frames), std::memory_order_relaxed);
+        return oboe::DataCallbackResult::Continue;
+    }
     int16_t* mono = cbScratch_.data();
 
     const float gain = muted_.load(std::memory_order_relaxed)
@@ -182,7 +221,13 @@ oboe::DataCallbackResult Transmitter::onAudioReady(oboe::AudioStream* stream,
 
     const size_t written = ring_.write(mono, frames);
     if (written < frames) {
+        // Account for the hole in the capture timeline as well as counting it:
+        // the sender thread folds it into the next packet's timestamp so the
+        // receiver conceals a gap instead of splicing two unrelated instants
+        // together and running permanently early.
         framesDropped_.fetch_add(frames - written, std::memory_order_relaxed);
+        pendingGap_.fetch_add(static_cast<uint32_t>(frames - written),
+                              std::memory_order_relaxed);
     }
     sem_post(&sem_);  // wait-free wake-up, safe from the audio callback
     return oboe::DataCallbackResult::Continue;
@@ -206,6 +251,7 @@ void Transmitter::senderLoop() {
 
         while (running_.load(std::memory_order_acquire) && ring_.size() >= fpp) {
             ring_.read(pcm.data(), fpp);
+            timestamp_ += pendingGap_.exchange(0, std::memory_order_relaxed);
             Header h;
             h.type      = kTypeAudio;
             h.channels  = 1;
@@ -246,14 +292,21 @@ void Transmitter::onErrorAfterClose(oboe::AudioStream* /*stream*/, oboe::Result 
     if (!running_.load(std::memory_order_acquire)) return;
     // Device change (headset plugged in, Bluetooth mic connected). Oboe has
     // already closed the stream on its own thread; reopen from a detached one.
-    std::thread([this] {
-        std::this_thread::sleep_for(std::chrono::milliseconds(200));
-        if (!running_.load(std::memory_order_acquire)) return;
-        if (openStream(inputPreset_) && !running_.load(std::memory_order_acquire)) {
-            // stop() ran while we were reopening and saw no stream to close;
-            // the one we just installed would otherwise hold the mic open.
-            closeStream();
+    // Retry with backoff - the new route is often not ready on the first try,
+    // and giving up once leaves the phone "live" with a dead microphone.
+    const uint32_t epoch = streamEpoch_.load(std::memory_order_acquire);
+    std::thread([this, epoch] {
+        int delayMs = 200;
+        for (int attempt = 0; attempt < 5; ++attempt) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(delayMs));
+            if (!running_.load(std::memory_order_acquire) ||
+                streamEpoch_.load(std::memory_order_acquire) != epoch) {
+                return;  // stopped, or a newer session owns the microphone now
+            }
+            if (openStream(inputPreset_, epoch)) return;
+            delayMs *= 2;
         }
+        LAU_LOGE("input stream did not come back after 5 attempts");
     }).detach();
 }
 

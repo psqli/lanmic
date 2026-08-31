@@ -63,7 +63,7 @@ fun MicScreen(settings: Settings) {
     var found by remember { mutableStateOf<List<Discovery.Found>>(emptyList()) }
     var stats by remember { mutableStateOf(TxStats()) }
 
-    fun portOrDefault() = port.toIntOrNull() ?: NativeAudio.DEFAULT_PORT
+    fun portOrDefault() = port.toPortOrNull() ?: NativeAudio.DEFAULT_PORT
 
     fun goLive() =
         AudioService.startTransmitter(ctx, host.trim(), portOrDefault(), packetFrames, preset)
@@ -77,8 +77,19 @@ fun MicScreen(settings: Settings) {
     ) { granted -> if (granted) goLive() }
 
     LaunchedEffect(Unit) {
+        var wasRunning = false
         while (true) {
-            stats = NativeAudio.txStats()
+            val s = NativeAudio.txStats()
+            if (s.running && !wasRunning) {
+                // A fresh engine comes up at unity gain and unmuted. These
+                // controls were restored from preferences, so push them back
+                // down: otherwise the slider reads 2.5x while the microphone is
+                // actually running at 1x until someone happens to nudge it.
+                muted = false
+                NativeAudio.setTxGain(gain)
+            }
+            wasRunning = s.running
+            stats = s
             delay(UI_POLL_MS)
         }
     }
@@ -98,7 +109,7 @@ fun MicScreen(settings: Settings) {
                 value = port,
                 onValueChange = {
                     port = it.filter { c -> c.isDigit() }.take(5)
-                    port.toIntOrNull()?.let { p -> settings.port = p }
+                    port.toPortOrNull()?.let { p -> settings.port = p }
                 },
                 label = { Text("Port") },
                 singleLine = true,

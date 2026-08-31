@@ -41,7 +41,10 @@ public:
     void stop();
     bool isRunning() const { return running_.load(std::memory_order_acquire); }
 
-    void  setGain(float g) { gain_.store(g, std::memory_order_relaxed); }
+    // Arrives from the UI through JNI; clamp rather than trust it.
+    void  setGain(float g) {
+        gain_.store(g > 0.0f ? (g < 8.0f ? g : 8.0f) : 0.0f, std::memory_order_relaxed);
+    }
     void  setMuted(bool m) { muted_.store(m, std::memory_order_relaxed); }
     bool  isMuted() const { return muted_.load(std::memory_order_relaxed); }
     TxStats stats() const;
@@ -51,7 +54,9 @@ public:
     void onErrorAfterClose(oboe::AudioStream* stream, oboe::Result error) override;
 
 private:
-    bool openStream(int inputPreset);
+    // `epoch` is the session the caller opened for. openStream refuses to
+    // install a stream whose session has already been torn down.
+    bool openStream(int inputPreset, uint32_t epoch);
     void closeStream();
     void senderLoop();
     void sendControl(uint8_t type, int repeats);
@@ -68,12 +73,20 @@ private:
     sem_t             sem_{};
     std::thread       sender_;
     std::atomic<bool> running_{false};
+    // Bumped on every start and stop. An error-recovery reopen that was
+    // sleeping across a stop/start pair sees the change and stands down rather
+    // than installing a second input stream feeding the same ring.
+    std::atomic<uint32_t> streamEpoch_{0};
 
     std::atomic<float>    gain_{1.0f};
     std::atomic<bool>     muted_{false};
     std::atomic<uint32_t> peakMilli_{0};
     std::atomic<uint64_t> packetsSent_{0};
     std::atomic<uint64_t> framesDropped_{0};
+    // Frames the audio callback could not fit in the ring. The sender thread
+    // adds them to the packet timestamp so the receiver conceals the hole
+    // instead of splicing the stream shorter.
+    std::atomic<uint32_t> pendingGap_{0};
     std::atomic<uint32_t> sendErrors_{0};
 
     uint32_t ssrc_      = 0;

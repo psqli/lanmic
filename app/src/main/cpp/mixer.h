@@ -3,6 +3,7 @@
 // reads them through an atomic state word and never allocates.
 #pragma once
 
+#include <algorithm>
 #include <atomic>
 #include <cmath>
 #include <cstdint>
@@ -44,7 +45,8 @@ public:
     // Returns nullptr when the table is full.
     JitterBuffer* acquire(uint32_t ssrc, int64_t nowMs) {
         for (auto& s : slots_) {
-            if (s.state.load(std::memory_order_acquire) == kActive && s.ssrc == ssrc) {
+            if (s.state.load(std::memory_order_acquire) == kActive &&
+                s.ssrc.load(std::memory_order_relaxed) == ssrc) {
                 s.lastSeenMs.store(nowMs, std::memory_order_relaxed);
                 return &s.jb;
             }
@@ -52,7 +54,7 @@ public:
         for (auto& s : slots_) {
             if (s.state.load(std::memory_order_acquire) == kFree) {
                 s.jb.resetState();
-                s.ssrc = ssrc;
+                s.ssrc.store(ssrc, std::memory_order_relaxed);
                 s.peakMilli.store(0, std::memory_order_relaxed);
                 s.muted.store(0, std::memory_order_relaxed);
                 s.gainMilli.store(1000, std::memory_order_relaxed);
@@ -66,7 +68,8 @@ public:
 
     void retire(uint32_t ssrc) {
         for (auto& s : slots_) {
-            if (s.state.load(std::memory_order_acquire) == kActive && s.ssrc == ssrc) {
+            if (s.state.load(std::memory_order_acquire) == kActive &&
+                s.ssrc.load(std::memory_order_relaxed) == ssrc) {
                 s.state.store(kFree, std::memory_order_release);
             }
         }
@@ -113,7 +116,7 @@ public:
             if (n >= maxOut) break;
             if (s.state.load(std::memory_order_acquire) != kActive) continue;
             const JitterStats js = s.jb.stats();
-            dst[n].ssrc         = s.ssrc;
+            dst[n].ssrc         = s.ssrc.load(std::memory_order_relaxed);
             dst[n].peakMilli    = s.peakMilli.load(std::memory_order_relaxed);
             dst[n].bufferFrames = js.fillFrames;
             dst[n].packets      = js.packets;
@@ -128,16 +131,22 @@ public:
         return n;
     }
 
+    // Clamped here rather than trusted: this arrives from the UI through JNI,
+    // and a negative value would wrap into a gain of several million.
     void setGain(uint32_t ssrc, int gainMilli) {
+        const uint32_t g =
+            static_cast<uint32_t>(std::clamp(gainMilli, 0, static_cast<int>(kMeterCeiling)));
         for (auto& s : slots_) {
-            if (s.state.load(std::memory_order_acquire) == kActive && s.ssrc == ssrc)
-                s.gainMilli.store(static_cast<uint32_t>(gainMilli), std::memory_order_relaxed);
+            if (s.state.load(std::memory_order_acquire) == kActive &&
+                s.ssrc.load(std::memory_order_relaxed) == ssrc)
+                s.gainMilli.store(g, std::memory_order_relaxed);
         }
     }
 
     void setMuted(uint32_t ssrc, bool muted) {
         for (auto& s : slots_) {
-            if (s.state.load(std::memory_order_acquire) == kActive && s.ssrc == ssrc)
+            if (s.state.load(std::memory_order_acquire) == kActive &&
+                s.ssrc.load(std::memory_order_relaxed) == ssrc)
                 s.muted.store(muted ? 1u : 0u, std::memory_order_relaxed);
         }
     }
@@ -147,7 +156,10 @@ private:
 
     struct Slot {
         std::atomic<uint32_t> state{kFree};
-        uint32_t              ssrc = 0;
+        // Written by the network thread on acquire, read by the UI thread in
+        // snapshot/setGain/setMuted. Ordered against `state`, but atomic in its
+        // own right so those reads are not a plain race on a torn-down slot.
+        std::atomic<uint32_t> ssrc{0};
         JitterBuffer          jb;
         std::atomic<int64_t>  lastSeenMs{0};
         std::atomic<uint32_t> peakMilli{0};

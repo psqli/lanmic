@@ -64,6 +64,18 @@ jobs:
       - name: Build debug APK
         run: ./gradlew --no-daemon assembleDebug
 
+      # The engine links with -Wl,--no-undefined, so an unresolved symbol fails
+      # the build rather than dlopen on a device. This checks the other half:
+      # that the library is actually packaged, for every ABI we claim.
+      - name: Check the engine is packaged for every ABI
+        run: |
+          apk=app/build/outputs/apk/debug/app-debug.apk
+          for abi in arm64-v8a armeabi-v7a x86_64; do
+            unzip -l "$apk" "lib/$abi/liblanmic.so" | grep -q liblanmic.so \
+              || { echo "::error::liblanmic.so missing for $abi"; exit 1; }
+            echo "ok: lib/$abi/liblanmic.so"
+          done
+
       - uses: actions/upload-artifact@v4
         with:
           name: lanmic-debug-apk

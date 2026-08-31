@@ -1,5 +1,7 @@
 package com.lanmic.audio
 
+import android.content.Context
+import android.net.wifi.WifiManager
 import android.util.Log
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
@@ -7,6 +9,7 @@ import java.net.DatagramPacket
 import java.net.DatagramSocket
 import java.net.InetAddress
 import java.net.SocketTimeoutException
+import java.nio.charset.StandardCharsets
 
 /**
  * LAU1 discovery. Kept in Kotlin on purpose: it is not on the audio path, and
@@ -67,7 +70,7 @@ object Discovery {
                     }
                     if (!isLau(pkt.data, pkt.length) || pkt.data[4].toInt() != 4) continue
                     val name = if (pkt.length > HEADER) {
-                        String(pkt.data, HEADER, pkt.length - HEADER)
+                        String(pkt.data, HEADER, pkt.length - HEADER, StandardCharsets.UTF_8)
                     } else {
                         "server"
                     }
@@ -81,22 +84,33 @@ object Discovery {
         found.values.toList()
     }
 
-    /** Answers DISCOVER probes while the server is running. */
-    class Responder(private val name: String) {
+    /**
+     * Answers DISCOVER probes while the server is running.
+     *
+     * Holds a [WifiManager.MulticastLock] for its lifetime: Android drops
+     * broadcast and multicast datagrams that are not addressed to the device
+     * before they reach the socket unless one is held, which makes the mixer
+     * undiscoverable with the screen off.
+     */
+    class Responder(context: Context, private val name: String) {
+        private val appContext = context.applicationContext
+
         @Volatile private var running = false
         private var socket: DatagramSocket? = null
         private var thread: Thread? = null
+        private var multicastLock: WifiManager.MulticastLock? = null
 
         fun start() {
             if (running) return
             running = true
+            acquireMulticastLock()
             thread = Thread({
                 try {
                     DatagramSocket(NativeAudio.DISCOVERY_PORT).use { sock ->
                         socket = sock
                         sock.broadcast = true
                         sock.soTimeout = 500
-                        val payload = name.toByteArray()
+                        val payload = name.toByteArray(StandardCharsets.UTF_8)
                         val reply = header(4) + payload
                         val buf = ByteArray(256)
                         while (running) {
@@ -126,6 +140,22 @@ object Discovery {
             socket?.close()
             thread?.join(1000)
             thread = null
+            multicastLock?.let { if (it.isHeld) it.release() }
+            multicastLock = null
+        }
+
+        private fun acquireMulticastLock() {
+            try {
+                val wm = appContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
+                multicastLock = wm.createMulticastLock("lanmic:discovery").apply {
+                    setReferenceCounted(false)
+                    acquire()
+                }
+            } catch (e: Exception) {
+                // Discovery still works on networks that do not filter; manual
+                // address entry works regardless.
+                Log.w(TAG, "multicast lock unavailable: ${e.message}")
+            }
         }
     }
 }

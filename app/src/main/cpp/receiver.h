@@ -11,17 +11,18 @@
 #include "mixer.h"
 #include "protocol.h"
 #include "udp_socket.h"
+#include "util.h"
 
 namespace lau {
 
 struct RxStats {
-    uint64_t packets      = 0;
-    uint64_t badPackets   = 0;
+    uint64_t packets       = 0;
+    uint64_t badPackets    = 0;
     uint32_t activeSources = 0;
-    uint32_t xruns        = 0;
-    float    masterPeak   = 0.0f;
-    float    limiterGain  = 1.0f;
-    float    latencyMs    = 0.0f;
+    uint32_t xruns         = 0;
+    float    masterPeak    = 0.0f;
+    float    limiterGain   = 1.0f;
+    float    latencyMs     = 0.0f;
 };
 
 // Binds the audio port, keeps one jitter buffer per source, and sums them in
@@ -43,7 +44,7 @@ public:
     void setSourceMuted(uint32_t ssrc, bool m) { sources_.setMuted(ssrc, m); }
 
     int     snapshot(SourceSnapshot* dst, int maxOut) const {
-        return sources_.snapshot(dst, maxOut, nowMsCached());
+        return sources_.snapshot(dst, maxOut, nowMs());
     }
     RxStats stats() const;
 
@@ -53,8 +54,8 @@ public:
 
 private:
     bool openStream();
+    void closeStream();
     void networkLoop();
-    static int64_t nowMsCached();
 
     mutable std::mutex                 streamLock_;
     std::shared_ptr<oboe::AudioStream> stream_;

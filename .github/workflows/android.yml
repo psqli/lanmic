@@ -5,7 +5,26 @@ on:
   workflow_dispatch:
 
 jobs:
+  tests:
+    name: Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install the server's dependencies
+        run: pip install -r server/requirements.txt
+
+      # Covers the platform-independent half of the engine and the Python
+      # server, including the sanitizer runs the lock-free buffers rely on.
+      - name: Run the test suites
+        run: tools/run_tests.sh --sanitize
+
   apk:
+    name: Debug APK
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -24,13 +43,6 @@ jobs:
 
       - name: Build debug APK
         run: ./gradlew --no-daemon assembleDebug
-
-      - name: Run the host tests for the C++ core
-        run: |
-          cd tools
-          g++ -std=c++17 -O2 -Wall -Wextra -I../app/src/main/cpp \
-              host_test.cpp ../app/src/main/cpp/udp_socket.cpp -o host_test -lpthread
-          ./host_test
 
       - uses: actions/upload-artifact@v4
         with:

@@ -87,19 +87,21 @@ class Source:
 
     # ---- writer (network thread), lock held ----
 
-    def _write(self, arr: np.ndarray) -> None:
+    def _write(self, arr: np.ndarray) -> bool:
+        """Append `arr`, or drop it whole. Returns False when it was dropped."""
         n = len(arr)
         if n == 0:
-            return
+            return True
         free = self.cap - (self.w - self.r)
         if n > free:
-            return  # reader stalled; dropping is better than corrupting
+            return False  # reader stalled; dropping is better than corrupting
         i = self.w % self.cap
         first = min(n, self.cap - i)
         self.buf[i:i + first] = arr[:first]
         if n > first:
             self.buf[0:n - first] = arr[first:]
         self.w += n
+        return True
 
     def _prime(self, ts: int) -> None:
         self._write(np.zeros(self.target, dtype=np.int16))
@@ -137,10 +139,15 @@ class Source:
 
             if frames:
                 if muted or pcm is None:
-                    self._write(np.zeros(frames, dtype=np.int16))
+                    written = self._write(np.zeros(frames, dtype=np.int16))
                 else:
-                    self._write(pcm)
-                self.write_ts = (ts + frames) & 0xFFFFFFFF
+                    written = self._write(pcm)
+                # Only advance the write cursor for audio we actually stored.
+                # Leaving it put makes the next packet arrive as a timestamp
+                # gap, so the drop is concealed instead of silently shortening
+                # the stream - this is what the C++ receiver does.
+                if written:
+                    self.write_ts = (ts + frames) & 0xFFFFFFFF
 
     # ---- reader (audio callback) ----
 

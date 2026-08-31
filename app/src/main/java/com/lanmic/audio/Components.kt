@@ -14,15 +14,15 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Brush
-import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.unit.dp
 import kotlin.math.log10
 
+// Green until it is loud, yellow approaching the ceiling, red at it.
 private val MeterStops = arrayOf(
-    0.00f to Color(0xFF22C55E),
-    0.70f to Color(0xFF22C55E),
-    0.86f to Color(0xFFFACC15),
-    1.00f to Color(0xFFEF4444)
+    0.00f to Palette.Ok,
+    0.70f to Palette.Ok,
+    0.86f to Palette.Warning,
+    1.00f to Palette.Danger
 )
 
 /** Peak meter on a dBFS scale (-60..0 dB), which is how ears and mixers think. */
@@ -36,7 +36,7 @@ fun LevelMeter(peak: Float, modifier: Modifier = Modifier, heightDp: Int = 10) {
             .height(heightDp.dp)
     ) {
         val r = CornerRadius(size.height / 2f, size.height / 2f)
-        drawRoundRect(color = Color(0xFF1F2933), cornerRadius = r)
+        drawRoundRect(color = Palette.MeterTrack, cornerRadius = r)
         if (frac > 0.001f) {
             drawRoundRect(
                 brush = Brush.horizontalGradient(
@@ -58,11 +58,11 @@ fun StatRow(label: String, value: String, warn: Boolean = false) {
         horizontalArrangement = Arrangement.SpaceBetween,
         verticalAlignment = Alignment.CenterVertically
     ) {
-        Text(label, style = MaterialTheme.typography.bodySmall, color = Color(0xFF94A3B8))
+        Text(label, style = MaterialTheme.typography.bodySmall, color = Palette.TextMuted)
         Text(
             value,
             style = MaterialTheme.typography.bodySmall,
-            color = if (warn) Color(0xFFF87171) else Color(0xFFE2E8F0)
+            color = if (warn) Palette.Alert else Palette.TextBody
         )
     }
 }

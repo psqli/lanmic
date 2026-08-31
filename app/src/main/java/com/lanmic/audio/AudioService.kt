@@ -116,7 +116,7 @@ class AudioService : Service() {
                 worker.execute {
                     if (NativeAudio.startServer(port, jitter)) {
                         mode = "server"
-                        responder = Discovery.Responder(name).also { it.start() }
+                        responder = Discovery.Responder(this, name).also { it.start() }
                     } else {
                         Log.e(TAG, "server failed to start")
                         stopEverything()

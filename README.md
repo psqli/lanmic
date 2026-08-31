@@ -28,28 +28,42 @@ budget are in [PROTOCOL.md](PROTOCOL.md); how the code is put together is in
 ## Layout
 
 ```
-app/src/main/cpp/       audio engine: Oboe streams, jitter buffers, mixer, UDP
+rust/                   audio engine: protocol, jitter buffers, mixer, UDP,
+                        the Oboe streams and the JNI surface
 app/src/main/java/      Kotlin UI, foreground service, discovery
 server/                 desktop mixing server + a test transmitter
-tools/                  host-side tests for the C++ core and the Python server
+tools/                  test runner for both suites
 PROTOCOL.md             wire format, jitter strategy, latency budget
 docs/ARCHITECTURE.md    module map, threading model, invariants
 ```
 
 ## Build the app
 
-Requires Android Studio (Ladybug or newer) with the NDK and CMake installed.
+Requires Android Studio (Ladybug or newer) with the NDK installed, plus a Rust
+toolchain and `cargo-ndk`:
 
 ```bash
-# from the project root - the Gradle wrapper is included
+rustup target add aarch64-linux-android armv7-linux-androideabi \
+                  x86_64-linux-android
+cargo install cargo-ndk
+```
+
+Then, from the project root — the Gradle wrapper is included:
+
+```bash
 ./gradlew assembleDebug
 adb install -r app/build/outputs/apk/debug/app-debug.apk
 ```
 
-First build pulls the Gradle distribution, the AndroidX/Compose artifacts and
-Oboe from `services.gradle.org`, `maven.google.com` and Maven Central, plus the
-NDK and CMake through the SDK manager. Budget a few GB and a coffee; after that
-it is incremental.
+Gradle builds the Rust engine for each packaged ABI and drops the resulting
+`liblanmic.so` into the APK; there is nothing to run by hand. The engine is
+always built in release, even for a debug APK, because an unoptimised realtime
+audio path misses its deadlines.
+
+First build pulls the Gradle distribution, the AndroidX/Compose artifacts, the
+NDK, and the Rust crates — Oboe among them, as vendored C++ sources that
+`oboe-sys` compiles and links into the same `.so`. Budget a few GB and a
+coffee; after that it is incremental.
 
 No local Android SDK? Push the repo to GitHub and
 `.github/workflows/android.yml` builds `app-debug.apk` for you and uploads it as
@@ -57,9 +71,6 @@ a workflow artifact - it also runs both test suites on every push.
 
 `minSdk` is 26. AAudio's low-latency MMAP path arrives properly in API 27+; on
 older devices Oboe falls back to OpenSL ES and capture latency roughly doubles.
-
-Everything is fetched from Maven — Oboe 1.9.3 comes in through `prefab`, so
-there is no vendored native source to build.
 
 ## Run the desktop server
 
@@ -149,18 +160,21 @@ The threading model and the invariants behind these choices are written up in
 ## Tests
 
 ```bash
-tools/run_tests.sh              # C++ core + Python server
-tools/run_tests.sh --sanitize   # the same, under ASan/UBSan and TSan
+tools/run_tests.sh              # Rust engine + Python server
+tools/run_tests.sh --strict     # the same, plus rustfmt and clippy
 ```
 
-`host_test` covers the platform-independent half of the engine — everything
-except the Oboe streams — and passes clean under ASan, UBSan and TSan. The
-Python suite covers the same behaviours in `lan_audio_server.py`, so the two
-implementations stay in step. CI runs both on every push.
+`cargo test` covers everything except the two Oboe streams, including an
+end-to-end suite that runs a ramp from the capture encoder, over a real
+loopback socket, through the jitter buffers and out of the mixer, and checks it
+sample by sample. No device required. The Python suite covers the same
+behaviours in `lan_audio_server.py`, so the two implementations stay in step.
+CI runs both on every push.
 
 ## Limits
 
-* 8 simultaneous microphones on the Android mixer (`kMaxSources` in `mixer.h`).
+* 8 simultaneous microphones on the Android mixer (`MAX_SOURCES` in
+  `rust/src/mixer.rs`).
 * Mono on the wire; the mixer plays the same mix to every output channel.
 * No encryption and no authentication. Anyone on the LAN can send audio to the
   mixer. Use a private AP.

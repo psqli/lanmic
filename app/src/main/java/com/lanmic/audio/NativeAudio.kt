@@ -1,6 +1,13 @@
 package com.lanmic.audio
 
-/** Thin JNI facade over the C++ audio engine. All calls are cheap and non-blocking. */
+/**
+ * Thin JNI facade over the Rust audio engine in `rust/`. All calls are cheap
+ * and non-blocking.
+ *
+ * The stat calls return null only if the VM cannot allocate the array, which
+ * in practice means the process is already finished; they are typed nullable
+ * so that reads as an empty frame rather than a crash.
+ */
 object NativeAudio {
 
     init {
@@ -24,7 +31,7 @@ object NativeAudio {
     private external fun nativeIsTransmitting(): Boolean
     private external fun nativeSetTxGain(gain: Float)
     private external fun nativeSetTxMuted(muted: Boolean)
-    private external fun nativeTxStats(): DoubleArray
+    private external fun nativeTxStats(): DoubleArray?
 
     fun startTransmitter(host: String, port: Int, packetFrames: Int, inputPreset: Int) =
         nativeStartTransmitter(host, port, packetFrames, inputPreset)
@@ -36,7 +43,7 @@ object NativeAudio {
 
     fun txStats(): TxStats {
         val v = nativeTxStats()
-        if (v.size < 7) return TxStats()
+        if (v == null || v.size < 7) return TxStats()
         return TxStats(
             packetsSent = v[0].toLong(),
             framesDropped = v[1].toLong(),
@@ -56,8 +63,8 @@ object NativeAudio {
     private external fun nativeSetMasterGain(gain: Float)
     private external fun nativeSetSourceGain(ssrc: Long, gain: Float)
     private external fun nativeSetSourceMuted(ssrc: Long, muted: Boolean)
-    private external fun nativeServerStats(): DoubleArray
-    private external fun nativeServerSources(): DoubleArray
+    private external fun nativeServerStats(): DoubleArray?
+    private external fun nativeServerSources(): DoubleArray?
 
     fun startServer(port: Int, jitterMs: Int) = nativeStartServer(port, jitterMs)
     fun stopServer() = nativeStopServer()
@@ -68,7 +75,7 @@ object NativeAudio {
 
     fun serverStats(): RxStats {
         val v = nativeServerStats()
-        if (v.size < 8) return RxStats()
+        if (v == null || v.size < 8) return RxStats()
         return RxStats(
             packets = v[0].toLong(),
             badPackets = v[1].toLong(),
@@ -82,7 +89,7 @@ object NativeAudio {
     }
 
     fun serverSources(): List<SourceInfo> {
-        val v = nativeServerSources()
+        val v = nativeServerSources() ?: return emptyList()
         val out = ArrayList<SourceInfo>(v.size / 9)
         var i = 0
         while (i + 8 < v.size) {

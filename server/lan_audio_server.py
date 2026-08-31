@@ -21,7 +21,7 @@ import struct
 import sys
 import threading
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 import numpy as np
 
@@ -104,7 +104,13 @@ class Source:
         return True
 
     def _prime(self, ts: int) -> None:
-        self._write(np.zeros(self.target, dtype=np.int16))
+        # Top the buffer up to the target rather than always appending one, so
+        # a re-prime on a buffer that is already deep does not stack another
+        # target of latency on top of it and leave it there until the reader's
+        # trim ceiling is crossed.
+        have = self.w - self.r
+        if have < self.target:
+            self._write(np.zeros(self.target - have, dtype=np.int16))
         self.write_ts = ts
         self.primed = True
 
@@ -189,12 +195,20 @@ class Limiter:
         peak = float(np.max(np.abs(x))) if x.size else 0.0
         wanted = self.ceiling / peak if peak > self.ceiling else 1.0
         if wanted < self.gain:
-            new_gain = wanted                      # instant attack
+            # Instant attack, applied flat across the whole block. Ramping down
+            # from the old, higher gain would let the samples at the head of the
+            # block through above the ceiling - the one thing a limiter must not
+            # do, and audible as clipping in whatever the mix is fed into.
+            new_gain = wanted
+            ramp = np.full(x.size, new_gain, dtype=np.float32)
         else:
+            # Release is the only direction worth ramping: gain is climbing
+            # towards a block that already fits, so the ceiling is not at risk
+            # and a step here would be an audible zipper.
             block_ms = x.size * 1000.0 / SAMPLE_RATE
             a = min(1.0, block_ms / self.release_ms)
             new_gain = self.gain + (wanted - self.gain) * a
-        ramp = np.linspace(self.gain, new_gain, x.size, dtype=np.float32)
+            ramp = np.linspace(self.gain, new_gain, x.size, dtype=np.float32)
         self.gain = new_gain
         return x * ramp
 

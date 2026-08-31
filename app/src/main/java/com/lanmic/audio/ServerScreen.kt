@@ -34,7 +34,9 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.withContext
 import kotlin.math.log10
 
 /** Buffer depth beyond which a source strip flags itself in the UI. */
@@ -49,11 +51,30 @@ fun ServerScreen(settings: Settings) {
     var master by remember { mutableFloatStateOf(settings.masterGain) }
     var stats by remember { mutableStateOf(RxStats()) }
     var sources by remember { mutableStateOf<List<SourceInfo>>(emptyList()) }
-    val addresses = remember { localIpv4Addresses() }
+    var addresses by remember { mutableStateOf<List<String>>(emptyList()) }
 
+    // Re-read rather than snapshot at composition: the operator moves between
+    // access points, and an address that is no longer on the phone is worse
+    // than no address at all. Enumerating interfaces is a syscall walk, so it
+    // stays off the main thread and off the 80 ms cadence.
     LaunchedEffect(Unit) {
         while (true) {
-            stats = NativeAudio.serverStats()
+            addresses = withContext(Dispatchers.IO) { localIpv4Addresses() }
+            delay(3000)
+        }
+    }
+
+    LaunchedEffect(Unit) {
+        var wasRunning = false
+        while (true) {
+            val s = NativeAudio.serverStats()
+            if (s.running && !wasRunning) {
+                // A fresh engine comes up at unity; the slider was restored
+                // from preferences and has to be pushed back down to match.
+                NativeAudio.setMasterGain(master)
+            }
+            wasRunning = s.running
+            stats = s
             sources = NativeAudio.serverSources()
             delay(UI_POLL_MS)
         }
@@ -78,7 +99,7 @@ fun ServerScreen(settings: Settings) {
                 value = port,
                 onValueChange = {
                     port = it.filter { c -> c.isDigit() }.take(5)
-                    port.toIntOrNull()?.let { p -> settings.port = p }
+                    port.toPortOrNull()?.let { p -> settings.port = p }
                 },
                 label = { Text("Port") },
                 singleLine = true,
@@ -148,7 +169,7 @@ fun ServerScreen(settings: Settings) {
                 AudioService.stop(ctx)
             } else {
                 AudioService.startServer(
-                    ctx, port.toIntOrNull() ?: NativeAudio.DEFAULT_PORT, jitterMs, Build.MODEL
+                    ctx, port.toPortOrNull() ?: NativeAudio.DEFAULT_PORT, jitterMs, Build.MODEL
                 )
             }
         },

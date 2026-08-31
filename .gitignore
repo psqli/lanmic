@@ -6,7 +6,7 @@ build/
 .cxx/
 .DS_Store
 captures/
-tools/host_test
-tools/host_test_address
-tools/host_test_thread
 __pycache__/
+
+# Rust
+rust/target/

@@ -15,13 +15,21 @@ jobs:
         with:
           python-version: '3.11'
 
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+
       - name: Install the server's dependencies
         run: pip install -r server/requirements.txt
 
-      # Covers the platform-independent half of the engine and the Python
-      # server, including the sanitizer runs the lock-free buffers rely on.
+      # Covers everything in the engine except the two Oboe streams, plus the
+      # Python server, plus clippy and rustfmt.
       - name: Run the test suites
-        run: tools/run_tests.sh --sanitize
+        run: tools/run_tests.sh --strict
 
   apk:
     name: Debug APK
@@ -37,7 +45,19 @@ jobs:
       # The runner already ships an Android SDK; this pins the pieces we need.
       - uses: android-actions/setup-android@v3
         with:
-          packages: 'platform-tools platforms;android-35 build-tools;35.0.0 ndk;27.0.12077973 cmake;3.22.1'
+          packages: 'platform-tools platforms;android-35 build-tools;35.0.0 ndk;27.0.12077973'
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android, armv7-linux-androideabi, x86_64-linux-android
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+
+      # Gradle shells out to this to build the engine for each packaged ABI.
+      - name: Install cargo-ndk
+        run: cargo install cargo-ndk --locked
 
       - uses: gradle/actions/setup-gradle@v4
 

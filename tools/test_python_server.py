@@ -92,6 +92,18 @@ def test_source():
     check(u.w - u.r == 360, "re-primed to target")
 
 
+def test_reprime_depth():
+    print("re-prime depth")
+    src = S.Source(7, 240)
+    for i in range(8):
+        src.on_packet(i, i * 120, np.full(120, 3, dtype=np.int16), 120, False)
+    check(src.w - src.r == 240 + 8 * 120, "buffer is deep")
+    # A jump far beyond max_gap is a sender restart: prime back up to the
+    # target, do not stack another target of silence on what is already there.
+    src.on_packet(8, 5_000_000, np.full(120, 4, dtype=np.int16), 120, False)
+    check(src.w - src.r == 240 + 9 * 120, "re-prime tops up rather than stacks")
+
+
 def test_full_buffer():
     print("full buffer")
     src = S.Source(9, 240)
@@ -117,12 +129,17 @@ def test_limiter():
     lim = S.Limiter()
     hot = np.full(4800, 3.0, dtype=np.float32)
     out = lim.process(hot)
-    check(float(np.max(np.abs(out))) <= 3.0, "no gain increase")
+    # Instant attack means the very first block is already under the ceiling.
+    check(float(np.max(np.abs(out))) <= 0.9801, "first block already limited")
     out2 = lim.process(np.full(4800, 3.0, dtype=np.float32))
-    check(float(np.max(np.abs(out2))) <= 0.9801, "settled below ceiling")
+    check(float(np.max(np.abs(out2))) <= 0.9801, "stays below ceiling")
     for _ in range(20):
         lim.process(np.full(4800, 0.05, dtype=np.float32))
     check(lim.gain > 0.9, "released back open")
+    # ... and a transient arriving into an open limiter is caught on arrival,
+    # not one block later.
+    spike = lim.process(np.full(240, 5.0, dtype=np.float32))
+    check(float(np.max(np.abs(spike))) <= 0.9801, "transient caught on arrival")
 
 
 def test_end_to_end():
@@ -214,6 +231,7 @@ def test_discovery():
 
 test_header()
 test_source()
+test_reprime_depth()
 test_full_buffer()
 test_limiter()
 test_end_to_end()

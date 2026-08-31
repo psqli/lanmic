@@ -40,6 +40,7 @@ conceal, mix - on a desktop, with no device and no Oboe.
 | `jitter.rs` | One buffer per source: timestamp alignment, concealment, trimming, loss counters. Split into `JitterWriter` and `JitterReader`. |
 | `mixer.rs` | `Table` (fixed 8 slots, no allocation) split into `SourceWriter` and `Mixer`, plus the lookahead-free `Limiter`. |
 | `meter.rs` | Peak meter ballistics shared by all three meters. |
+| `feedback.rs` | Single-sideband frequency shifter: the anti-howlround measure on the mix bus. |
 | `net.rs` | UDP helpers over `socket2`: DSCP EF so Wi-Fi treats the flow as voice, and the port range check. |
 | `util.rs` | Monotonic clock, milli-unit atomics, best-effort thread priority. |
 | `transmitter.rs` | `CaptureEncoder` (downmix, gain, meter) and `Packetiser` (ring → wire). Portable. |
@@ -215,5 +216,10 @@ Real, understood, and deliberately not fixed.
 * **Each stream open leaks a small callback object**, because `oboe` boxes the
   callback and never reclaims it. What leaks is a `Weak` handle, a few dozen
   bytes per reopen; the buffers it points at are freed with the engine.
-* **No acoustic echo cancellation**, and none is wanted: this is
-  reinforcement, not conferencing.
+* **No acoustic echo cancellation**, and none is possible: the microphone and
+  the loudspeaker are separate devices, so the capturing end has no far-end
+  reference to cancel against. Feedback is held off instead by shifting the mix
+  a few hertz (`feedback.rs`), which denies the loop the phase coherence it
+  needs. That is worth 6-10 dB before ringing, not immunity, and it is a
+  colouration - inaudible on speech at these depths, audible on music, which is
+  why it is adjustable and can be switched off.

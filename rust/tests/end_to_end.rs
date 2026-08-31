@@ -27,6 +27,12 @@ struct Rig {
 fn rig() -> Rig {
     let rx_shared = Arc::new(RxShared::default());
     let (router, mixer, table) = receiver::build(0, JITTER_MS, rx_shared.clone()).unwrap();
+    // These tests are about what the transport does to the samples, so the
+    // feedback shift comes out of the path - it deliberately rewrites every one
+    // of them. That it is on by default, and reaches the bus, is covered by
+    // `feedback_suppression_is_on_by_default_and_reaches_the_bus` and by
+    // `the_default_suppression_survives_the_real_receiver_path` below.
+    table.set_feedback_shift_hz(0.0);
     let port = router.local_port();
     Rig {
         router,
@@ -95,6 +101,42 @@ fn a_ramp_survives_capture_wire_and_mix_sample_accurate() {
     }
     assert_eq!(index, PACKETS * FRAMES);
     assert_eq!(r.table.active_sources(), 1);
+}
+
+#[test]
+fn the_default_suppression_survives_the_real_receiver_path() {
+    // `rig()` switches the shift off; this checks what an operator actually
+    // gets from `receiver::build`, which is where the table comes from in the
+    // app: suppression on, at a working depth, colouring the bus.
+    let rx_shared = Arc::new(RxShared::default());
+    let (mut router, mut mixer, table) = receiver::build(0, JITTER_MS, rx_shared).unwrap();
+    assert_eq!(
+        table.feedback_shift_hz(),
+        lanmic::mixer::DEFAULT_FEEDBACK_SHIFT_HZ
+    );
+
+    let (mut enc, mut tx, _shared) = microphone(router.local_port(), 240);
+    let pcm: Vec<i16> = (0..240)
+        .map(|i| ((i as f32 * 0.13).sin() * 16000.0) as i16)
+        .collect();
+    for _ in 0..2 {
+        enc.push(&pcm, 1);
+    }
+    tx.pump();
+    drain(&mut router, 0, 8);
+
+    for _ in 0..TARGET_FRAMES / BLOCK {
+        mixer.render(BLOCK);
+    }
+    let out = mixer.render(BLOCK);
+    assert!(out.iter().any(|s| s.abs() > 0.01), "the bus is silent");
+    // Shifted, so not a sample-for-sample copy of what went in.
+    let same = out
+        .iter()
+        .zip(&pcm)
+        .filter(|(o, &p)| (**o - p as f32 / 32768.0).abs() < 1e-4)
+        .count();
+    assert!(same < out.len() / 2, "the shift did not reach the bus");
 }
 
 #[test]

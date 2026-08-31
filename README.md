@@ -130,7 +130,7 @@ the variance immediately.
 | `lost` counter rising steadily | Wi-Fi congestion — move the AP, drop other clients |
 | Latency feels high but counters are clean | Lower the jitter buffer, try 2.5 ms packets |
 | Distortion when several people talk | Pull the master down; the limiter is clamping |
-| Feedback howl | The mixer's speaker is feeding the mics — that's physics, not software |
+| Feedback howl | Raise the feedback suppression on the mixer; then move mics out of the speakers' throw |
 
 Packet size is a direct trade: 2.5 ms shaves latency but triples the packet
 rate (400/s per mic), which some cheap APs handle badly. 5 ms is the default
@@ -178,5 +178,8 @@ CI runs both on every push.
 * Mono on the wire; the mixer plays the same mix to every output channel.
 * No encryption and no authentication. Anyone on the LAN can send audio to the
   mixer. Use a private AP.
-* No AEC — this is reinforcement, not a conference call. Keep microphones out
-  of the speakers' throw.
+* Feedback suppression is a frequency shift, not echo cancellation, and it buys
+  roughly 6-10 dB before ringing rather than solving the problem. There is no
+  AEC and there cannot be one worth having: the microphone and the loudspeaker
+  are different devices, so the capturing end has no reference to cancel
+  against. Keep microphones out of the speakers' throw.

@@ -18,6 +18,10 @@ object NativeAudio {
     const val DISCOVERY_PORT = 45679
     const val SAMPLE_RATE = 48000
 
+    /** Matches `DEFAULT_FEEDBACK_SHIFT_HZ` / `MAX_FEEDBACK_SHIFT_HZ` in the engine. */
+    const val DEFAULT_FEEDBACK_SHIFT_HZ = 5f
+    const val MAX_FEEDBACK_SHIFT_HZ = 10f
+
     // ---- transmitter ----
 
     private external fun nativeStartTransmitter(
@@ -61,6 +65,7 @@ object NativeAudio {
     private external fun nativeStopServer()
     private external fun nativeIsServing(): Boolean
     private external fun nativeSetMasterGain(gain: Float)
+    private external fun nativeSetFeedbackShift(hz: Float)
     private external fun nativeSetSourceGain(ssrc: Long, gain: Float)
     private external fun nativeSetSourceMuted(ssrc: Long, muted: Boolean)
     private external fun nativeServerStats(): DoubleArray?
@@ -70,6 +75,12 @@ object NativeAudio {
     fun stopServer() = nativeStopServer()
     fun isServing() = nativeIsServing()
     fun setMasterGain(gain: Float) = nativeSetMasterGain(gain)
+
+    /**
+     * Frequency shift applied to the whole mix, in Hz, to hold off howlround.
+     * 0 switches it off. See `rust/src/feedback.rs`.
+     */
+    fun setFeedbackShift(hz: Float) = nativeSetFeedbackShift(hz)
     fun setSourceGain(ssrc: Long, gain: Float) = nativeSetSourceGain(ssrc, gain)
     fun setSourceMuted(ssrc: Long, muted: Boolean) = nativeSetSourceMuted(ssrc, muted)
 

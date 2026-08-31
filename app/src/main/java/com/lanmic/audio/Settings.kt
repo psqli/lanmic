@@ -52,4 +52,13 @@ class Settings private constructor(private val p: SharedPreferences) {
     var masterGain: Float
         get() = p.getFloat("master", 1f)
         set(v) = p.edit().putFloat("master", v).apply()
+
+    /**
+     * Feedback-suppression depth in Hz on the mix bus; 0 is off. On by default,
+     * because a microphone and a loudspeaker in one room is the normal case for
+     * this app rather than the exception.
+     */
+    var feedbackShiftHz: Float
+        get() = p.getFloat("feedbackShift", NativeAudio.DEFAULT_FEEDBACK_SHIFT_HZ)
+        set(v) = p.edit().putFloat("feedbackShift", v).apply()
 }

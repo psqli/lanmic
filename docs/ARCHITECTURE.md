@@ -46,6 +46,7 @@ conceal, mix - on a desktop, with no device and no Oboe.
 | `receiver.rs` | `PacketRouter` (socket → source table) and the stereo interleave. Portable. |
 | `android.rs` | The two Oboe streams and the threads around them. The only device-specific code. |
 | `bridge.rs` | The whole JNI surface. Two engines behind two mutexes. |
+| `build.rs` | Android link configuration: `libc++abi`, and `-Wl,--no-undefined` so a missing symbol fails the build instead of `dlopen`. |
 
 Dependencies are deliberately few: `rtrb` for the wait-free SPSC rings,
 `socket2` for the socket options `std` does not expose, `oboe` for the audio
@@ -205,6 +206,12 @@ Real, understood, and deliberately not fixed.
   of it rather than starting exactly at the peak.
 * **Clock drift is shed, not tracked.** The trim drops the oldest audio every
   few minutes instead of resampling to the receiver's clock.
+* **The C++ runtime is linked statically.** `oboe-sys` pulls in
+  `libc++_static.a`, which leaves the ABI runtime to `libc++abi.a` - linked
+  explicitly in `build.rs`, because a shared object may carry undefined symbols
+  and the link would otherwise succeed with `__cxa_pure_virtual` missing,
+  failing only at `dlopen` on a device. `-Wl,--no-undefined` is there so that
+  cannot happen again silently.
 * **Each stream open leaks a small callback object**, because `oboe` boxes the
   callback and never reclaims it. What leaks is a `Weak` handle, a few dozen
   bytes per reopen; the buffers it points at are freed with the engine.

@@ -1,32 +1,29 @@
 #!/usr/bin/env bash
 #
-# Builds and runs both test suites: the C++ core and the Python server.
+# Builds and runs both test suites: the Rust engine and the Python server.
 # This is what CI runs, so a green run here is a green run there.
 #
 #   ./run_tests.sh              # both suites
-#   ./run_tests.sh --sanitize   # C++ suite again under ASan/UBSan, then TSan
+#   ./run_tests.sh --strict     # also clippy and rustfmt, as CI does
 #
 set -euo pipefail
 
 cd "$(dirname "$0")"
-CPP=../app/src/main/cpp
-CXXFLAGS="-std=c++17 -Wall -Wextra -I$CPP"
-SOURCES="host_test.cpp $CPP/udp_socket.cpp"
-SANITIZE=0
-[ "${1:-}" = "--sanitize" ] && SANITIZE=1
+RUST=../rust
+STRICT=0
+[ "${1:-}" = "--strict" ] && STRICT=1
 
-echo "==> C++ core"
-g++ $CXXFLAGS -O2 $SOURCES -o host_test -lpthread
-./host_test
+echo "==> Rust engine"
+# The whole engine except the two Oboe streams is portable, so this covers the
+# protocol, the ring, the jitter buffer, the meter, the mixer, the limiter, and
+# a real UDP loopback from capture through to a sample-accurate mix.
+cargo test --manifest-path $RUST/Cargo.toml --locked
 
-if [ "$SANITIZE" = "1" ]; then
-    # The engine's whole point is two threads meeting in lock-free buffers, so
-    # the sanitizer runs are the ones that actually matter.
-    for san in address,undefined thread; do
-        echo "==> C++ core under -fsanitize=$san"
-        g++ $CXXFLAGS -O1 -g -fsanitize=$san $SOURCES -o "host_test_${san%%,*}" -lpthread
-        "./host_test_${san%%,*}"
-    done
+if [ "$STRICT" = "1" ]; then
+    echo "==> rustfmt"
+    cargo fmt --manifest-path $RUST/Cargo.toml --check
+    echo "==> clippy"
+    cargo clippy --manifest-path $RUST/Cargo.toml --all-targets --locked -- -D warnings
 fi
 
 echo "==> Python server"

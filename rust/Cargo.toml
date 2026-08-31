@@ -1,0 +1,35 @@
+[package]
+name = "lanmic"
+version = "1.0.0"
+edition = "2021"
+rust-version = "1.77"
+publish = false
+description = "LAU1 low-latency LAN audio engine: capture, transport, jitter buffering and mixing"
+
+[lib]
+name = "lanmic"
+# cdylib is what the APK loads; rlib keeps the portable half linkable by tests
+# and by any future desktop front-end.
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+# Wait-free SPSC ring, purpose-built for audio: bulk chunk transfers, no
+# allocation after construction, and the producer/consumer split is a type.
+rtrb = "0.4"
+# Raw socket options the std wrapper does not expose - DSCP/TOS above all,
+# which is what gets our packets into the Wi-Fi voice queue.
+socket2 = { version = "0.6", features = ["all"] }  # "all" unlocks IPV6_TCLASS
+log = "0.4"
+
+[target.'cfg(target_os = "android")'.dependencies]
+oboe = "0.6"
+jni = "0.21"
+android_logger = "0.15"
+# setpriority(2) for the network and sender threads; nothing else needs libc.
+libc = "0.2"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"

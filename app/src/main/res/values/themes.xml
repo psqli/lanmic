@@ -1,0 +1,7 @@
+<resources>
+    <style name="Theme.LanMic" parent="android:Theme.Material.NoActionBar">
+        <item name="android:statusBarColor">#FF101418</item>
+        <item name="android:navigationBarColor">#FF101418</item>
+        <item name="android:windowBackground">#FF101418</item>
+    </style>
+</resources>

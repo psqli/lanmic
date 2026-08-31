@@ -1,0 +1,10 @@
+*.iml
+.gradle/
+local.properties
+.idea/
+build/
+.cxx/
+.DS_Store
+captures/
+tools/host_test
+__pycache__/

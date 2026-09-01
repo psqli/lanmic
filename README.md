@@ -1,5 +1,15 @@
 # LAN Mic
 
+> **A message from a human**
+>
+> Around ten years ago (~2017) I was working on a small project called _IPMic_
+> for allowing Android phones to be used as real-time / live microphones on
+> Wi-Fi LAN. It took a few months for a prototype that worked on a terminal of
+> a rooted Android phone. The server was a CLI app on a Linux machine.
+>
+> Today (31/08/2026), with a simple description, Claude Opus 5 developed a
+> fully functional app in a few minutes.
+
 Wireless microphones for live presentations, over your own Wi-Fi, with no codec
 in the path. An Android phone becomes a microphone; another phone (or a laptop)
 becomes the mixer plugged into the PA.

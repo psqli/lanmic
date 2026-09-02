@@ -31,7 +31,9 @@
 //! Everything except [`android`] runs anywhere, which is what lets the test
 //! suite exercise the whole path - capture, packetise, socket, conceal, mix -
 //! without a device. Only the two Oboe streams and the JNI surface need a
-//! phone.
+//! phone. The desktop front-end in `desktop/` links this same crate and
+//! supplies cpal streams in their place; [`supervisor`] is the lifecycle both
+//! of them drive their streams with.
 
 pub mod feedback;
 pub mod jitter;
@@ -40,6 +42,7 @@ pub mod mixer;
 pub mod net;
 pub mod protocol;
 pub mod receiver;
+pub mod supervisor;
 pub mod transmitter;
 pub mod util;
 

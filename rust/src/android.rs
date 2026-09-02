@@ -1,12 +1,9 @@
 //! Oboe streams and the threads around them. The only part of the engine that
 //! a phone is required to run.
 //!
-//! One rule shapes this whole module: **exactly one thread ever creates,
-//! starts or destroys an audio stream.** The supervisor owns its stream from
-//! `start` to `stop`, including reopening it after a device change. Nothing
-//! else can install a stream, so two live streams - two producers on a
-//! single-producer ring - are not a race to be guarded against but a state
-//! that cannot be constructed.
+//! The lifecycle around them is [`crate::supervisor`], shared with the desktop
+//! front-end: one thread owns a stream from `start` to `stop`, reopening it
+//! after a device change, and nothing else can install one.
 
 use std::io;
 use std::sync::atomic::Ordering;
@@ -25,13 +22,10 @@ use oboe::{
 use crate::mixer::{Mixer, Table};
 use crate::protocol::{PacketType, SAMPLE_RATE};
 use crate::receiver::{self, RxShared, RxStats};
+use crate::supervisor::supervise;
 use crate::transmitter::{self, CaptureEncoder, TxShared, TxStats};
 use crate::util;
 
-/// How often the supervisor wakes to refresh stats and notice a dead stream.
-const SUPERVISOR_TICK: Duration = Duration::from_millis(200);
-/// Backoff ceiling for reopening a stream that will not come back.
-const MAX_REOPEN_BACKOFF: Duration = Duration::from_millis(3200);
 /// How long the sender thread sleeps if the audio callback never wakes it.
 const SENDER_PARK: Duration = Duration::from_millis(100);
 
@@ -197,69 +191,6 @@ fn open_input(
         .map_err(|e| oboe_err("start input stream", e))?;
     log::info!("input stream up: burst {burst} frames");
     Ok(stream)
-}
-
-/// The shape both supervisors share: open once, report whether that worked,
-/// then keep the stream alive until asked to stop.
-///
-/// `open` is called on this thread and nowhere else, which is the whole point.
-fn supervise<S, O, P>(
-    running: impl Fn() -> bool,
-    restart_requested: impl Fn() -> bool,
-    mut open: O,
-    mut publish: P,
-    ready: mpsc::Sender<io::Result<()>>,
-) where
-    O: FnMut() -> io::Result<S>,
-    P: FnMut(&mut S),
-{
-    let mut stream = match open() {
-        Ok(s) => {
-            let _ = ready.send(Ok(()));
-            Some(s)
-        }
-        Err(e) => {
-            let _ = ready.send(Err(e));
-            return;
-        }
-    };
-
-    let mut backoff = SUPERVISOR_TICK;
-    while running() {
-        thread::sleep(SUPERVISOR_TICK);
-        if !running() {
-            break;
-        }
-
-        if let Some(s) = stream.as_mut() {
-            publish(s);
-        }
-
-        if restart_requested() {
-            // Oboe has already stopped and closed it; letting our handle go is
-            // all that is left before reopening.
-            stream = None;
-        }
-        if stream.is_none() {
-            match open() {
-                Ok(s) => {
-                    stream = Some(s);
-                    backoff = SUPERVISOR_TICK;
-                }
-                Err(e) => {
-                    // The device that took the route away is often still busy
-                    // on the first try, and giving up once would leave a live
-                    // session with dead audio.
-                    log::warn!("stream did not come back: {e}; retrying");
-                    thread::sleep(backoff);
-                    backoff = (backoff * 2).min(MAX_REOPEN_BACKOFF);
-                }
-            }
-        }
-    }
-    // Explicit, so the stream is closed - and its callbacks quiesced - before
-    // the state they reach through drops.
-    drop(stream);
 }
 
 /// The mixer end: binds the audio port, sums every source, plays the result.

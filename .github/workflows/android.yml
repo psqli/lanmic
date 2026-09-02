@@ -21,13 +21,25 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
         with:
-          workspaces: rust
+          workspaces: |
+            rust
+            desktop
+
+      # gpui and cpal need these; without them run_tests.sh skips the desktop
+      # suite, and a skipped suite in CI is a suite that does not exist.
+      - name: Install the desktop app's system libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libasound2-dev libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev \
+            libx11-dev libxcb1-dev libfontconfig1-dev
 
       - name: Install the server's dependencies
         run: pip install -r server/requirements.txt
 
-      # Covers everything in the engine except the two Oboe streams, plus the
-      # Python server, plus clippy and rustfmt.
+      # Covers everything in the engine except the two Oboe streams, everything
+      # in the desktop app except the cpal streams and the GPUI elements, and
+      # the Python server - plus clippy and rustfmt over both crates.
       - name: Run the test suites
         run: tools/run_tests.sh --strict
 

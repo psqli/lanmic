@@ -1,0 +1,54 @@
+[package]
+name = "lanmic-desktop"
+version = "1.0.0"
+edition = "2021"
+# cpal 0.18 is the floor; gpui wants a recent compiler of its own.
+rust-version = "1.85"
+publish = false
+description = "LAN Mic for the desktop: the LAU1 engine behind a GPUI front-end"
+
+# The engine crate is built for phones as a cdylib; here it is the rlib half,
+# linked directly. Everything below the audio streams - protocol, jitter
+# buffers, mixer, limiter, feedback shifter, sockets - is that crate, unchanged.
+[[bin]]
+name = "lanmic"
+path = "src/main.rs"
+
+[dependencies]
+lanmic = { path = "../rust" }
+# Zed's GPU-accelerated UI framework. Retained-mode-ish elements, flexbox
+# layout, and a render pass driven from one thread - which suits a UI whose
+# whole job is to poll atomics the audio threads publish.
+gpui = "0.2"
+# What Oboe is on the phone: one API over ALSA, CoreAudio and WASAPI.
+cpal = "0.18"
+# Only to answer "which address do I tell the phones?".
+if-addrs = "0.14"
+log = "0.4"
+env_logger = "0.11"
+
+# gpui's test platform: a window with no display behind it, so the render pass
+# - layout, element ids, every panel - runs under `cargo test` and in CI rather
+# than only on a machine with a GPU.
+[dev-dependencies]
+gpui = { version = "0.2", features = ["test-support"] }
+
+# Only for the headless mode's Ctrl-C handler, so a session's Drop runs and the
+# mixer gets its BYE instead of a two-second timeout.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+# Thin rather than fat LTO. The engine crate uses fat, and should: it is small,
+# and inlining the ring and the mixer across crate boundaries is the point. Here
+# the realtime code is that same crate and is already optimised, while the rest
+# of the tree is GPUI, resvg, image and naga - where fat LTO buys a little
+# binary size for many minutes of link time, on a build the README tells people
+# to run.
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+
+# Its own workspace root: the engine crate is a plain path dependency, so
+# `rust/` keeps its own lockfile and the Gradle build that reads it.
+[workspace]

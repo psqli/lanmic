@@ -113,6 +113,17 @@ buffer depth and loss counters — plus the master fader, the feedback shifter a
 the limiter's gain reduction. **Microphone** finds a mixer (or takes an address
 typed in), picks an input, and ships.
 
+The window is built on
+[gpui-component](https://github.com/longbridge/gpui-component) — its buttons,
+sliders, text inputs, titlebar and window frame, painted with this app's own
+palette. On Linux that frame gives the window a titlebar, border and resize
+edges where the desktop does not provide them — which is every GNOME Wayland
+session, because Mutter does not implement server-side decorations. Drag the
+title to move, double-click it to maximise, right-click it for the window menu,
+and use the buttons at its right to minimise, maximise or close. Where the platform does
+draw them — macOS, Windows, X11 under a window manager — you get the native
+ones instead.
+
 No screen, or no GPU for GPUI to talk to? The same binary runs on a terminal:
 
 ```bash

@@ -10,6 +10,8 @@ pub const BG: u32 = 0x14161a;
 pub const PANEL: u32 = 0x1c1f26;
 pub const PANEL_ALT: u32 = 0x232732;
 pub const BORDER: u32 = 0x2e3440;
+/// Used where a line has to separate two areas rather than outline one:
+/// the titlebar from the panels below it.
 pub const BORDER_STRONG: u32 = 0x3d4658;
 pub const TEXT: u32 = 0xe6e9ef;
 pub const MUTED: u32 = 0x8b93a7;

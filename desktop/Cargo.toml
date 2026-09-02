@@ -20,6 +20,10 @@ lanmic = { path = "../rust" }
 # layout, and a render pass driven from one thread - which suits a UI whose
 # whole job is to poll atomics the audio threads publish.
 gpui = "0.2"
+# Components on top of it: buttons, sliders, text inputs, a titlebar and the
+# Linux window border. It pins the same `gpui` we do, so the types are the same
+# types - and it means this crate is not carrying its own text input.
+gpui-component = "0.5"
 # What Oboe is on the phone: one API over ALSA, CoreAudio and WASAPI.
 cpal = "0.18"
 # The command line. Derive, because the flags are a struct and writing them

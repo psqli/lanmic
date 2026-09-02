@@ -5,6 +5,10 @@
 //! network is keeping up.
 
 use gpui::{div, prelude::*, px, rgb, Context, IntoElement};
+use gpui_component::button::{Button, ButtonVariants};
+use gpui_component::input::Input;
+use gpui_component::slider::Slider;
+use gpui_component::{h_flex, v_flex, Disableable, Selectable, Sizable};
 
 use lanmic::transmitter::TxStats;
 
@@ -13,44 +17,37 @@ use crate::audio::Direction;
 use super::mixer::device_rows;
 use super::theme::*;
 use super::widgets::*;
-use super::{Field, LanMic, SliderId, MAX_GAIN};
+use super::LanMic;
 
 impl LanMic {
     pub(super) fn render_mic(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let running = self.mic.is_some();
         let stats = self.mic.as_ref().map(|m| m.stats()).unwrap_or_default();
 
-        div()
-            .flex()
-            .flex_row()
+        h_flex()
             .gap_3()
             .flex_1()
             .min_h(px(0.))
+            .items_start()
             .child(
-                div()
-                    .flex()
-                    .flex_col()
+                v_flex()
                     .gap_3()
                     .w(px(360.))
+                    .flex_none()
                     .child(self.mic_server(running, cx))
                     .child(self.mic_input_device(running, cx)),
             )
             .child(
-                div()
-                    .flex()
-                    .flex_col()
+                v_flex()
                     .gap_3()
                     .flex_1()
                     .min_w(px(0.))
                     .child(self.mic_level(&stats, cx))
-                    .child(self.mic_counters(&stats))
-                    .child(div().flex_1()),
+                    .child(self.mic_counters(&stats)),
             )
     }
 
     fn mic_server(&mut self, running: bool, cx: &mut Context<Self>) -> impl IntoElement {
-        let host_focused = self.focused == Some(Field::MicHost);
-        let port_focused = self.focused == Some(Field::MicPort);
         let searching = self.searching;
         let found = self.found.clone();
         let packet = self.options.mic.frames_per_packet;
@@ -58,65 +55,45 @@ impl LanMic {
         panel()
             .child(heading("Server"))
             .child(
-                div()
-                    .flex()
-                    .flex_row()
+                h_flex()
                     .gap_2()
                     .child(
-                        div()
-                            .flex()
-                            .flex_col()
+                        v_flex()
                             .gap_1()
                             .flex_1()
                             .child(label("mixer address"))
-                            .child(
-                                field("mic-host", self.field(Field::MicHost), host_focused)
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.focused = Some(Field::MicHost);
-                                        cx.notify();
-                                    })),
-                            ),
+                            .child(Input::new(&self.mic_host).small()),
                     )
                     .child(
-                        div()
-                            .flex()
-                            .flex_col()
+                        v_flex()
                             .gap_1()
                             .w(px(84.))
+                            .flex_none()
                             .child(label("port"))
-                            .child(
-                                field("mic-port", self.field(Field::MicPort), port_focused)
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.focused = Some(Field::MicPort);
-                                        cx.notify();
-                                    })),
-                            ),
+                            .child(Input::new(&self.mic_port).small()),
                     ),
             )
             .child(
-                div()
-                    .flex()
-                    .flex_row()
+                h_flex()
                     .gap_2()
                     .items_center()
-                    .child(if searching {
-                        disabled("find-server", "searching...")
-                    } else {
-                        button("find-server", "Find server", ButtonKind::Secondary).on_click(
-                            cx.listener(|this, _, _, cx| {
-                                this.find_servers(cx);
+                    .child(
+                        Button::new("find-server")
+                            .label(if searching { "searching..." } else { "Find server" })
+                            .outline()
+                            .small()
+                            .disabled(searching)
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.find_servers(window, cx);
                                 cx.notify();
-                            }),
-                        )
-                    })
+                            })),
+                    )
                     .child(label("broadcasts on the discovery port")),
             )
             .children(found.iter().enumerate().map(|(index, server)| {
                 let host = server.host();
-                div()
+                h_flex()
                     .id(("found", index))
-                    .flex()
-                    .flex_row()
                     .justify_between()
                     .gap_2()
                     .px_2()
@@ -128,17 +105,15 @@ impl LanMic {
                     .border_color(rgb(BORDER))
                     .cursor_pointer()
                     .hover(|this| this.border_color(rgb(ACCENT)))
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.field_mut(Field::MicHost).value = host.clone();
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.set_host(host.clone(), window, cx);
                         cx.notify();
                     }))
                     .child(div().truncate().child(server.name.clone()))
                     .child(div().text_color(rgb(MUTED)).child(server.host()))
             }))
             .child(
-                div()
-                    .flex()
-                    .flex_row()
+                h_flex()
                     .items_center()
                     .justify_between()
                     .child(label(if running {
@@ -147,7 +122,10 @@ impl LanMic {
                         "packet size"
                     }))
                     .child(
-                        button("packet-size", packet_label(packet), ButtonKind::Secondary)
+                        Button::new("packet-size")
+                            .label(packet_label(packet))
+                            .outline()
+                            .xsmall()
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.cycle_packet_size();
                                 cx.notify();
@@ -158,21 +136,20 @@ impl LanMic {
                 "2.5 ms shaves latency and triples the packet rate; 5 ms is the default for a reason.",
             ))
             .child(
-                button(
-                    "mic-toggle",
-                    if running { "STOP" } else { "GO LIVE" },
-                    if running {
-                        ButtonKind::Danger
-                    } else {
-                        ButtonKind::Primary
-                    },
-                )
-                .w_full()
-                .py_2()
-                .on_click(cx.listener(|this, _, _, cx| {
-                    this.toggle_mic();
-                    cx.notify();
-                })),
+                Button::new("mic-toggle")
+                    .label(if running { "STOP" } else { "GO LIVE" })
+                    .map(|button| {
+                        if running {
+                            button.danger()
+                        } else {
+                            button.primary()
+                        }
+                    })
+                    .w_full()
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.toggle_mic(cx);
+                        cx.notify();
+                    })),
             )
     }
 
@@ -185,19 +162,19 @@ impl LanMic {
 
         panel()
             .child(
-                div()
-                    .flex()
-                    .flex_row()
+                h_flex()
                     .items_center()
                     .justify_between()
                     .child(heading("Input"))
                     .child(
-                        button("rescan-in", "rescan", ButtonKind::Secondary).on_click(cx.listener(
-                            |this, _, _, cx| {
+                        Button::new("rescan-in")
+                            .label("rescan")
+                            .ghost()
+                            .xsmall()
+                            .on_click(cx.listener(|this, _, _, cx| {
                                 this.rescan_devices();
                                 cx.notify();
-                            },
-                        )),
+                            })),
                     ),
             )
             .when_some(live_name, |this, name| {
@@ -209,10 +186,8 @@ impl LanMic {
                 )
             })
             .child(
-                div()
+                v_flex()
                     .id("input-devices")
-                    .flex()
-                    .flex_col()
                     .gap_1()
                     .max_h(px(190.))
                     .overflow_y_scroll()
@@ -227,7 +202,6 @@ impl LanMic {
     }
 
     fn mic_level(&mut self, stats: &TxStats, cx: &mut Context<Self>) -> impl IntoElement {
-        let entity = cx.entity().downgrade();
         let muted = self.mic_muted;
         let target = self
             .mic
@@ -236,39 +210,31 @@ impl LanMic {
 
         panel()
             .child(
-                div()
-                    .flex()
-                    .flex_row()
+                h_flex()
                     .items_center()
                     .justify_between()
                     .child(heading("Level"))
                     .child(
-                        button(
-                            "mic-mute",
-                            if muted { "MUTED" } else { "mute" },
-                            ButtonKind::Toggle(muted),
-                        )
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.toggle_mic_mute();
-                            cx.notify();
-                        })),
+                        Button::new("mic-mute")
+                            .label(if muted { "MUTED" } else { "mute" })
+                            .outline()
+                            .xsmall()
+                            .selected(muted)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.toggle_mic_mute();
+                                cx.notify();
+                            })),
                     ),
             )
             .child(meter(if muted { 0.0 } else { stats.peak }, px(16.)))
             .child(
-                div()
-                    .flex()
-                    .flex_row()
+                h_flex()
                     .justify_between()
+                    .items_center()
                     .child(label("gain"))
-                    .child(label(format!("{:.2}x", self.mic_gain))),
+                    .child(readout_right(format!("{:.2}x", self.mic_gain), W_GAIN)),
             )
-            .child(slider(
-                "mic-gain",
-                self.mic_gain / MAX_GAIN,
-                entity,
-                |this: &mut LanMic, phase, at| this.slider_event(SliderId::MicGain, phase, at),
-            ))
+            .child(Slider::new(&self.mic_fader))
             .when(muted, |this| {
                 this.child(
                     div().text_xs().text_color(rgb(WARN)).child(
@@ -286,16 +252,12 @@ impl LanMic {
         panel()
             .child(heading("Counters"))
             .child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .flex_wrap()
-                    .gap_3()
-                    .child(stat("sent", stats.packets_sent.to_string()))
-                    .child(stat("dropped", stats.frames_dropped.to_string()))
-                    .child(stat("errors", stats.send_errors.to_string()))
-                    .child(stat("xrun", stats.xruns.to_string()))
-                    .child(stat("in", format!("{:.1} ms", stats.latency_ms))),
+                readings()
+                    .child(stat("sent", stats.packets_sent.to_string(), W_COUNT))
+                    .child(stat("dropped", stats.frames_dropped.to_string(), W_COUNT))
+                    .child(stat("errors", stats.send_errors.to_string(), W_COUNT))
+                    .child(stat("xrun", stats.xruns.to_string(), W_COUNT))
+                    .child(stat("in", format!("{:.1} ms", stats.latency_ms), W_MS)),
             )
             .when(losing, |this| {
                 this.child(

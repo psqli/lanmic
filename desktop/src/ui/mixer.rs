@@ -5,16 +5,20 @@
 //! Right is one strip per microphone, which is the part that has to be readable
 //! from across a room: name, meter, buffer depth, loss.
 
-use gpui::{div, prelude::*, px, rgb, Context, IntoElement};
+use gpui::{div, prelude::*, px, rgb, Context, Entity, IntoElement};
+use gpui_component::button::{Button, ButtonVariants};
+use gpui_component::input::Input;
+use gpui_component::slider::{Slider, SliderState};
+use gpui_component::{h_flex, v_flex, Selectable, Sizable};
 
-use lanmic::mixer::{SourceSnapshot, MAX_FEEDBACK_SHIFT_HZ, MAX_SOURCES};
+use lanmic::mixer::{SourceSnapshot, MAX_SOURCES};
 use lanmic::receiver::{RxStats, MAX_JITTER_MS, MIN_JITTER_MS};
 
 use crate::audio::Direction;
 
 use super::theme::*;
 use super::widgets::*;
-use super::{ms, Field, LanMic, SliderId, MAX_GAIN};
+use super::{ms, LanMic};
 
 impl LanMic {
     pub(super) fn render_mixer(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -29,18 +33,16 @@ impl LanMic {
                 ..Default::default()
             });
 
-        div()
-            .flex()
-            .flex_row()
+        h_flex()
             .gap_3()
             .flex_1()
             .min_h(px(0.))
+            .items_start()
             .child(
-                div()
-                    .flex()
-                    .flex_col()
+                v_flex()
                     .gap_3()
                     .w(px(320.))
+                    .flex_none()
                     .child(self.mixer_transport(running, cx))
                     .child(self.mixer_master(&stats, cx))
                     .child(self.mixer_output_device(running, cx))
@@ -51,51 +53,30 @@ impl LanMic {
 
     fn mixer_transport(&mut self, running: bool, cx: &mut Context<Self>) -> impl IntoElement {
         let jitter = self.options.server.jitter_ms;
-        let port_focused = self.focused == Some(Field::ServerPort);
-        let name_focused = self.focused == Some(Field::ServerName);
 
         panel()
             .child(heading("Mixer"))
             .child(
-                div()
-                    .flex()
-                    .flex_row()
+                h_flex()
                     .gap_2()
                     .child(
-                        div()
-                            .flex()
-                            .flex_col()
+                        v_flex()
                             .gap_1()
                             .w(px(96.))
+                            .flex_none()
                             .child(label("port"))
-                            .child(
-                                field("server-port", self.field(Field::ServerPort), port_focused)
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.focused = Some(Field::ServerPort);
-                                        cx.notify();
-                                    })),
-                            ),
+                            .child(Input::new(&self.server_port).small()),
                     )
                     .child(
-                        div()
-                            .flex()
-                            .flex_col()
+                        v_flex()
                             .gap_1()
                             .flex_1()
                             .child(label("name phones will see"))
-                            .child(
-                                field("server-name", self.field(Field::ServerName), name_focused)
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.focused = Some(Field::ServerName);
-                                        cx.notify();
-                                    })),
-                            ),
+                            .child(Input::new(&self.server_name).small()),
                     ),
             )
             .child(
-                div()
-                    .flex()
-                    .flex_row()
+                h_flex()
                     .items_center()
                     .justify_between()
                     .child(label(if running {
@@ -104,106 +85,94 @@ impl LanMic {
                         "jitter buffer"
                     }))
                     .child(
-                        div()
-                            .flex()
-                            .flex_row()
+                        h_flex()
                             .gap_1()
                             .items_center()
-                            .child(button("jitter-down", "-", ButtonKind::Secondary).on_click(
-                                cx.listener(|this, _, _, cx| {
-                                    this.nudge_jitter(-5);
-                                    cx.notify();
-                                }),
-                            ))
                             .child(
-                                div()
-                                    .w(px(56.))
-                                    .text_xs()
-                                    .text_color(rgb(TEXT))
-                                    .child(format!("{jitter} ms")),
+                                Button::new("jitter-down")
+                                    .label("-")
+                                    .outline()
+                                    .xsmall()
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.nudge_jitter(-5);
+                                        cx.notify();
+                                    })),
                             )
-                            .child(button("jitter-up", "+", ButtonKind::Secondary).on_click(
-                                cx.listener(|this, _, _, cx| {
-                                    this.nudge_jitter(5);
-                                    cx.notify();
-                                }),
-                            )),
+                            .child(readout_right(format!("{jitter} ms"), W_MS))
+                            .child(
+                                Button::new("jitter-up")
+                                    .label("+")
+                                    .outline()
+                                    .xsmall()
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.nudge_jitter(5);
+                                        cx.notify();
+                                    })),
+                            ),
                     ),
             )
             .child(label(format!(
                 "{MIN_JITTER_MS}..{MAX_JITTER_MS} ms. Raise it if the under counter climbs."
             )))
             .child(
-                button(
-                    "server-toggle",
-                    if running { "STOP" } else { "START MIXER" },
-                    if running {
-                        ButtonKind::Danger
-                    } else {
-                        ButtonKind::Primary
-                    },
-                )
-                .w_full()
-                .py_2()
-                .on_click(cx.listener(|this, _, _, cx| {
-                    this.toggle_server();
-                    cx.notify();
-                })),
+                Button::new("server-toggle")
+                    .label(if running { "STOP" } else { "START MIXER" })
+                    .map(|button| {
+                        if running {
+                            button.danger()
+                        } else {
+                            button.primary()
+                        }
+                    })
+                    .w_full()
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.toggle_server(cx);
+                        cx.notify();
+                    })),
             )
     }
 
     fn mixer_master(&mut self, stats: &RxStats, cx: &mut Context<Self>) -> impl IntoElement {
-        let entity = cx.entity().downgrade();
         let limiting = stats.limiter_gain < 0.999;
+        let _ = cx;
 
         panel()
             .child(heading("Master"))
             .child(meter(stats.master_peak, px(10.)))
             .child(
-                div()
-                    .flex()
-                    .flex_row()
+                h_flex()
                     .justify_between()
+                    .items_center()
                     .child(label("gain"))
-                    .child(label(format!("{:.2}x", self.master_gain))),
+                    .child(readout_right(format!("{:.2}x", self.master_gain), W_GAIN)),
             )
-            .child(slider(
-                "master-gain",
-                self.master_gain / MAX_GAIN,
-                entity.clone(),
-                |this: &mut LanMic, phase, at| this.slider_event(SliderId::MasterGain, phase, at),
-            ))
+            .child(Slider::new(&self.master_fader))
             .child(
-                div()
-                    .flex()
-                    .flex_row()
+                h_flex()
                     .justify_between()
+                    .items_center()
                     .child(label("feedback shift"))
-                    .child(label(if self.feedback_hz <= 0.0 {
-                        "off".to_string()
-                    } else {
-                        format!("{:.1} Hz", self.feedback_hz)
-                    })),
+                    .child(readout_right(
+                        if self.feedback_hz <= 0.0 {
+                            "off".to_string()
+                        } else {
+                            format!("{:.1} Hz", self.feedback_hz)
+                        },
+                        W_HZ,
+                    )),
             )
-            .child(slider(
-                "feedback-shift",
-                self.feedback_hz / MAX_FEEDBACK_SHIFT_HZ,
-                entity,
-                |this: &mut LanMic, phase, at| {
-                    this.slider_event(SliderId::FeedbackShift, phase, at)
-                },
-            ))
+            .child(Slider::new(&self.feedback_fader))
             .child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .flex_wrap()
-                    .gap_3()
-                    .child(stat("limiter", format!("{:.2}x", stats.limiter_gain)))
-                    .child(stat("pkts", stats.packets.to_string()))
-                    .child(stat("bad", stats.bad_packets.to_string()))
-                    .child(stat("xrun", stats.xruns.to_string()))
-                    .child(stat("out", format!("{:.1} ms", stats.latency_ms))),
+                readings()
+                    .child(stat(
+                        "limiter",
+                        format!("{:.2}x", stats.limiter_gain),
+                        W_GAIN,
+                    ))
+                    .child(stat("pkts", stats.packets.to_string(), W_COUNT))
+                    .child(stat("bad", stats.bad_packets.to_string(), W_COUNT))
+                    .child(stat("xrun", stats.xruns.to_string(), W_COUNT))
+                    .child(stat("out", format!("{:.1} ms", stats.latency_ms), W_MS)),
             )
             .when(limiting, |this| {
                 this.child(
@@ -224,19 +193,19 @@ impl LanMic {
 
         panel()
             .child(
-                div()
-                    .flex()
-                    .flex_row()
+                h_flex()
                     .items_center()
                     .justify_between()
                     .child(heading("Output"))
                     .child(
-                        button("rescan-out", "rescan", ButtonKind::Secondary).on_click(
-                            cx.listener(|this, _, _, cx| {
+                        Button::new("rescan-out")
+                            .label("rescan")
+                            .ghost()
+                            .xsmall()
+                            .on_click(cx.listener(|this, _, _, cx| {
                                 this.rescan_devices();
                                 cx.notify();
-                            }),
-                        ),
+                            })),
                     ),
             )
             .when_some(live_name, |this, name| {
@@ -248,10 +217,8 @@ impl LanMic {
                 )
             })
             .child(
-                div()
+                v_flex()
                     .id("output-devices")
-                    .flex()
-                    .flex_col()
                     .gap_1()
                     .max_h(px(150.))
                     .overflow_y_scroll()
@@ -288,20 +255,19 @@ impl LanMic {
     }
 
     fn mixer_strips(&mut self, stats: &RxStats, cx: &mut Context<Self>) -> impl IntoElement {
-        let entity = cx.entity().downgrade();
         let sources = self.sources.clone();
         let running = self.server.is_some();
+        let faders: Vec<Option<Entity<SliderState>>> = sources
+            .iter()
+            .map(|source| self.fader_for(source.ssrc).cloned())
+            .collect();
 
-        div()
-            .flex()
-            .flex_col()
+        v_flex()
             .gap_2()
             .flex_1()
             .min_w(px(0.))
             .child(
-                div()
-                    .flex()
-                    .flex_row()
+                h_flex()
                     .items_center()
                     .justify_between()
                     .child(heading(format!(
@@ -311,10 +277,8 @@ impl LanMic {
                     .child(label("gain, mute and the buffer each one is running")),
             )
             .child(
-                div()
+                v_flex()
                     .id("strips")
-                    .flex()
-                    .flex_col()
                     .gap_2()
                     .flex_1()
                     .min_h(px(0.))
@@ -331,16 +295,21 @@ impl LanMic {
                     .children(
                         sources
                             .iter()
-                            .map(|source| strip(source, entity.clone(), cx)),
+                            .zip(faders)
+                            .map(|(source, fader)| strip(source, fader, cx)),
                     ),
             )
     }
 }
 
+/// The last reading in a strip's row, tagged so a test can measure where it
+/// lands. `debug_selector` compiles to nothing outside tests.
+pub(super) const STRIP_TAIL: &str = "strip-tail";
+
 /// One channel strip.
 fn strip(
     source: &SourceSnapshot,
-    entity: gpui::WeakEntity<LanMic>,
+    fader: Option<Entity<SliderState>>,
     cx: &mut Context<LanMic>,
 ) -> impl IntoElement {
     let ssrc = source.ssrc;
@@ -352,14 +321,13 @@ fn strip(
 
     panel()
         .child(
-            div()
-                .flex()
-                .flex_row()
+            h_flex()
                 .items_center()
                 .gap_2()
                 .child(
                     div()
                         .w(px(84.))
+                        .flex_none()
                         .text_xs()
                         .text_color(rgb(if stale { MUTED } else { TEXT }))
                         .child(format!("MIC-{:04X}", ssrc & 0xFFFF)),
@@ -370,41 +338,39 @@ fn strip(
                         .child(meter(if source.muted { 0.0 } else { level }, px(12.))),
                 )
                 .child(
-                    button(
-                        ("strip-mute", ssrc as u64),
-                        if source.muted { "MUTED" } else { "mute" },
-                        ButtonKind::Toggle(source.muted),
-                    )
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.toggle_source_mute(ssrc);
-                        cx.notify();
-                    })),
+                    Button::new(("strip-mute", ssrc as u64))
+                        .label(if source.muted { "MUTED" } else { "mute" })
+                        .outline()
+                        .xsmall()
+                        .selected(source.muted)
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.toggle_source_mute(ssrc);
+                            cx.notify();
+                        })),
                 ),
         )
         .child(
-            div()
-                .flex()
-                .flex_row()
+            h_flex()
                 .items_center()
                 .gap_3()
-                .child(div().w(px(84.)).child(label(format!("{gain:.2}x"))))
-                .child(div().flex_1().child(slider(
-                    ("strip-gain", ssrc as u64),
-                    gain / MAX_GAIN,
-                    entity,
-                    move |this: &mut LanMic, phase, at| {
-                        this.slider_event(SliderId::Source(ssrc), phase, at)
-                    },
-                )))
+                .child(readout(format!("{gain:.2}x"), W_GAIN))
+                .child(div().flex_1().children(fader.as_ref().map(Slider::new)))
                 .child(
-                    div()
-                        .flex()
-                        .flex_row()
-                        .gap_3()
-                        .child(stat("buf", format!("{:.0} ms", ms(source.buffer_frames))))
-                        .child(stat("lost", source.lost.to_string()))
-                        .child(stat("under", source.underruns.to_string()))
-                        .child(stat("pkts", source.packets.to_string())),
+                    readings()
+                        .child(stat(
+                            "buf",
+                            format!("{:.0} ms", ms(source.buffer_frames)),
+                            W_MS,
+                        ))
+                        .child(stat("lost", source.lost.to_string(), W_COUNT))
+                        .child(stat("under", source.underruns.to_string(), W_COUNT))
+                        // The last reading in the row: if anything before it
+                        // changes width, this is what moves. The tests measure
+                        // it for exactly that reason.
+                        .child(
+                            stat("pkts", source.packets.to_string(), W_COUNT)
+                                .debug_selector(|| STRIP_TAIL.into()),
+                        ),
                 ),
         )
 }
@@ -433,10 +399,8 @@ pub(super) fn device_rows(
                 None => device.is_default,
             };
             let name = device.name.clone();
-            div()
+            h_flex()
                 .id((prefix, index))
-                .flex()
-                .flex_row()
                 .items_center()
                 .justify_between()
                 .gap_2()

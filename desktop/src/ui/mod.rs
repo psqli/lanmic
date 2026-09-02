@@ -10,28 +10,47 @@
 //!   mod.rs        the view, its state, and everything that starts or stops
 //!   mixer.rs      the mixer panel: channel strips, master, feedback
 //!   mic.rs        the microphone panel: server, device, level
-//!   frame.rs      the window frame, where the platform does not draw one
-//!   widgets.rs    meter, slider, button, one-line text field
-//!   theme.rs      colours
+//!   widgets.rs    the peak meter and the fixed-width readouts around it
+//!   theme.rs      colours, which are also the component library's colours
 //! ```
 //!
+//! # What is drawn here and what is not
+//!
+//! Buttons, sliders, text inputs, the titlebar and the Linux window border are
+//! [`gpui_component`]'s. That is most of the chrome, including the three things
+//! a window cannot do without - moving, resizing and closing - which
+//! [`Root`] and [`TitleBar`] between them provide. What is left in this crate
+//! is the part that is about audio: the meter, the readouts, the panels, and
+//! the wiring from a control to an atomic.
+//!
+//! The state that used to back a hand-rolled slider and text field is gone with
+//! them. A slider is an [`Entity<SliderState>`] that emits [`SliderEvent`]; a
+//! field is an [`Entity<InputState>`] that emits [`InputEvent`]. This view
+//! subscribes and applies the result, and owns no drag state or key routing of
+//! its own.
+//!
 //! The refresh tick is the only thing that redraws: [`REFRESH`] wakes the view,
-//! it re-reads the counters, and GPUI diffs the result. Nothing here blocks on
-//! audio, and nothing on an audio thread knows this file exists.
+//! [`LanMic::poll`] re-reads the counters, and GPUI diffs the result. Nothing
+//! here blocks on audio, and nothing on an audio thread knows this file exists.
 
-mod frame;
 mod mic;
 mod mixer;
 mod theme;
 mod widgets;
 
+use std::collections::HashMap;
 use std::time::Duration;
 
 use gpui::{
-    div, prelude::*, px, rgb, size, App, Application, Bounds, Context, Decorations, FocusHandle,
-    KeyDownEvent, SharedString, Task, TitlebarOptions, Window, WindowBounds, WindowDecorations,
+    prelude::*, px, size, App, Application, Bounds, Context, Entity, SharedString, Subscription,
+    Task, TitlebarOptions, Window, WindowBackgroundAppearance, WindowBounds, WindowDecorations,
     WindowOptions,
 };
+use gpui_component::button::{Button, ButtonVariants};
+use gpui_component::input::{InputEvent, InputState};
+use gpui_component::slider::{SliderEvent, SliderState, SliderValue};
+use gpui_component::theme::{Theme, ThemeMode};
+use gpui_component::{h_flex, v_flex, Root, Selectable, Sizable, TitleBar};
 
 use lanmic::mixer::{SourceSnapshot, DEFAULT_FEEDBACK_SHIFT_HZ, MAX_FEEDBACK_SHIFT_HZ};
 use lanmic::protocol::SAMPLE_RATE;
@@ -53,8 +72,11 @@ const REFRESH: Duration = Duration::from_millis(80);
 /// Long enough for every mixer on a quiet LAN to answer, short enough that the
 /// button does not feel broken.
 const DISCOVERY_WAIT: Duration = Duration::from_millis(1200);
-/// Gains run 0..=2 (-inf..+6 dB); the sliders map that range.
+/// Gains run 0..=2 (-inf..+6 dB); the sliders carry that range themselves.
 const MAX_GAIN: f32 = 2.0;
+/// Fine enough that a fader feels continuous, coarse enough that a drag does
+/// not emit an event per pixel.
+const GAIN_STEP: f32 = 0.01;
 /// The packet sizes worth offering, in frames at 48 kHz: 2.5, 5, 10, 20 ms.
 const PACKET_SIZES: [usize; 4] = [120, 240, 480, 960];
 
@@ -64,39 +86,31 @@ pub enum Panel {
     Microphone,
 }
 
-/// The editable fields. There are four, so they are an enum and an array
-/// rather than four handles and a focus graph.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Field {
-    ServerPort,
-    ServerName,
-    MicHost,
-    MicPort,
+/// One microphone's fader. The subscription is held beside the state because
+/// dropping the pair is how a strip that has left the desk stops being wired
+/// to anything.
+struct SourceFader {
+    state: Entity<SliderState>,
+    _subscription: Subscription,
 }
 
-impl Field {
-    const ALL: [Field; 4] = [
-        Field::ServerPort,
-        Field::ServerName,
-        Field::MicHost,
-        Field::MicPort,
-    ];
-
-    fn index(self) -> usize {
-        Field::ALL.iter().position(|&f| f == self).unwrap_or(0)
+/// A slider reports a single value or a range; every slider here is single, and
+/// this is the one place that has to say so.
+fn single(value: SliderValue) -> f32 {
+    match value {
+        SliderValue::Single(v) => v,
+        SliderValue::Range(_, high) => high,
     }
 }
 
-/// Which slider a drag belongs to. A drag that starts on a slider keeps it
-/// until the button comes up, wherever the pointer goes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SliderId {
-    MasterGain,
-    FeedbackShift,
-    MicGain,
-    /// Per-source, keyed by ssrc rather than by strip position - strips move
-    /// when a microphone leaves and a drag must not follow them.
-    Source(u32),
+fn gain_slider(gain: f32, cx: &mut App) -> Entity<SliderState> {
+    cx.new(|_| {
+        SliderState::new()
+            .min(0.0)
+            .max(MAX_GAIN)
+            .step(GAIN_STEP)
+            .default_value(gain)
+    })
 }
 
 pub struct LanMic {
@@ -107,8 +121,16 @@ pub struct LanMic {
     /// The last thing that went wrong, shown until the next attempt.
     pub(super) error: Option<SharedString>,
 
-    pub(super) fields: [TextField; 4],
-    pub(super) focused: Option<Field>,
+    pub(super) server_port: Entity<InputState>,
+    pub(super) server_name: Entity<InputState>,
+    pub(super) mic_host: Entity<InputState>,
+    pub(super) mic_port: Entity<InputState>,
+
+    pub(super) master_fader: Entity<SliderState>,
+    pub(super) feedback_fader: Entity<SliderState>,
+    pub(super) mic_fader: Entity<SliderState>,
+    /// One per live microphone, made and dropped as strips come and go.
+    source_faders: HashMap<u32, SourceFader>,
 
     pub(super) output_devices: Vec<DeviceInfo>,
     pub(super) input_devices: Vec<DeviceInfo>,
@@ -120,31 +142,92 @@ pub struct LanMic {
     pub(super) searching: bool,
 
     /// Held here as well as in the engine so a stop and a start do not lose
-    /// the desk settings - and so the sliders have somewhere to read from
-    /// when nothing is running.
+    /// the desk settings.
     pub(super) master_gain: f32,
     pub(super) feedback_hz: f32,
     pub(super) mic_gain: f32,
     pub(super) mic_muted: bool,
-    pub(super) dragging: Option<SliderId>,
 
     /// Refilled from the source table on every tick.
     pub(super) sources: Vec<SourceSnapshot>,
 
-    focus: FocusHandle,
+    _subscriptions: Vec<Subscription>,
     _refresh: Task<()>,
 }
 
 impl LanMic {
     fn new(options: Options, window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let focus = cx.focus_handle();
-        focus.focus(window);
+        let port = options.server.port.to_string();
+        let name = options.server.name.clone();
+        let host = options.mic.host.clone();
+        let mic_port = options.mic.port.to_string();
 
-        let fields = [
-            TextField::number("45678", 5).with(options.server.port.to_string()),
-            TextField::text("this machine", 32).with(options.server.name.clone()),
-            TextField::text("192.168.1.50", 64).with(options.mic.host.clone()),
-            TextField::number("45678", 5).with(options.mic.port.to_string()),
+        let server_port = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("45678")
+                .default_value(port)
+        });
+        let server_name = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("this machine")
+                .default_value(name)
+        });
+        let mic_host = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("192.168.1.50")
+                .default_value(host)
+        });
+        let mic_port_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("45678")
+                .default_value(mic_port)
+        });
+
+        let master_fader = gain_slider(1.0, cx);
+        let feedback_fader = cx.new(|_| {
+            SliderState::new()
+                .min(0.0)
+                .max(MAX_FEEDBACK_SHIFT_HZ)
+                .step(0.1)
+                .default_value(DEFAULT_FEEDBACK_SHIFT_HZ)
+        });
+        let mic_fader = gain_slider(1.0, cx);
+
+        // Enter in an address or a port is "go", which is what someone who has
+        // just typed one means by it.
+        let subscriptions = vec![
+            cx.subscribe(&master_fader, |this, _, event: &SliderEvent, _| {
+                let SliderEvent::Change(value) = event;
+                this.set_master_gain(single(*value));
+            }),
+            cx.subscribe(&feedback_fader, |this, _, event: &SliderEvent, _| {
+                let SliderEvent::Change(value) = event;
+                this.set_feedback_hz(single(*value));
+            }),
+            cx.subscribe(&mic_fader, |this, _, event: &SliderEvent, _| {
+                let SliderEvent::Change(value) = event;
+                this.set_mic_gain(single(*value));
+            }),
+            cx.subscribe(&mic_host, |this, _, event: &InputEvent, cx| {
+                if matches!(event, InputEvent::PressEnter { .. }) && this.mic.is_none() {
+                    this.toggle_mic(cx);
+                }
+            }),
+            cx.subscribe(&mic_port_input, |this, _, event: &InputEvent, cx| {
+                if matches!(event, InputEvent::PressEnter { .. }) && this.mic.is_none() {
+                    this.toggle_mic(cx);
+                }
+            }),
+            cx.subscribe(&server_port, |this, _, event: &InputEvent, cx| {
+                if matches!(event, InputEvent::PressEnter { .. }) && this.server.is_none() {
+                    this.toggle_server(cx);
+                }
+            }),
+            cx.subscribe(&server_name, |this, _, event: &InputEvent, cx| {
+                if matches!(event, InputEvent::PressEnter { .. }) && this.server.is_none() {
+                    this.toggle_server(cx);
+                }
+            }),
         ];
 
         let refresh = cx.spawn(async move |this, cx| loop {
@@ -152,7 +235,7 @@ impl LanMic {
             // The view is gone: so is the window, and so is this loop.
             if this
                 .update(cx, |this, cx| {
-                    this.poll();
+                    this.poll(cx);
                     cx.notify();
                 })
                 .is_err()
@@ -173,8 +256,14 @@ impl LanMic {
             server: None,
             mic: None,
             error: None,
-            fields,
-            focused: None,
+            server_port,
+            server_name,
+            mic_host,
+            mic_port: mic_port_input,
+            master_fader,
+            feedback_fader,
+            mic_fader,
+            source_faders: HashMap::new(),
             output_devices: Vec::new(),
             input_devices: Vec::new(),
             addresses: Vec::new(),
@@ -184,9 +273,8 @@ impl LanMic {
             feedback_hz: DEFAULT_FEEDBACK_SHIFT_HZ,
             mic_gain: 1.0,
             mic_muted: false,
-            dragging: None,
             sources: Vec::new(),
-            focus,
+            _subscriptions: subscriptions,
             _refresh: refresh,
         };
         this.rescan_devices();
@@ -195,31 +283,17 @@ impl LanMic {
 
     // -- state ------------------------------------------------------------
 
-    pub(super) fn field(&self, which: Field) -> &TextField {
-        &self.fields[which.index()]
-    }
-
-    pub(super) fn field_mut(&mut self, which: Field) -> &mut TextField {
-        &mut self.fields[which.index()]
-    }
-
-    /// Reads what the audio threads have published since the last tick. This
-    /// is the only thing that writes `sources`, which is what keeps `render` a
-    /// function of state rather than a second place state is decided.
-    pub(super) fn poll(&mut self) {
-        match &self.server {
-            Some(server) => {
-                server.table().snapshot(now_ms(), &mut self.sources);
-                // One strip per source, in a stable order: without this the
-                // strips would reshuffle whenever a slot was reused.
-                self.sources.sort_by_key(|s| s.ssrc);
-            }
-            None => self.sources.clear(),
-        }
+    /// The trimmed contents of a field.
+    fn text(input: &Entity<InputState>, cx: &App) -> String {
+        input.read(cx).value().trim().to_string()
     }
 
     pub(super) fn is_live(&self) -> bool {
         self.server.is_some() || self.mic.is_some()
+    }
+
+    pub(super) fn fader_for(&self, ssrc: u32) -> Option<&Entity<SliderState>> {
+        self.source_faders.get(&ssrc).map(|fader| &fader.state)
     }
 
     /// Re-reads what this machine has: the device lists and its own addresses.
@@ -231,9 +305,56 @@ impl LanMic {
         self.addresses = discovery::local_addresses();
     }
 
-    /// Applies the desk settings to a table that has just been built. A new
-    /// session starts at unity by construction, which would silently undo a
-    /// master fader someone left down.
+    /// Reads what the audio threads have published since the last tick. This
+    /// is the only thing that writes `sources`, which is what keeps `render` a
+    /// function of state rather than a second place state is decided.
+    pub(super) fn poll(&mut self, cx: &mut Context<Self>) {
+        match &self.server {
+            Some(server) => {
+                server.table().snapshot(now_ms(), &mut self.sources);
+                // One strip per source, in a stable order: without this the
+                // strips would reshuffle whenever a slot was reused.
+                self.sources.sort_by_key(|s| s.ssrc);
+            }
+            None => self.sources.clear(),
+        }
+        self.sync_source_faders(cx);
+    }
+
+    /// Gives every live microphone a fader and takes it back when it leaves.
+    /// A fader outliving its strip would keep writing gain to a slot that has
+    /// been handed to somebody else.
+    fn sync_source_faders(&mut self, cx: &mut Context<Self>) {
+        let live: Vec<(u32, f32)> = self
+            .sources
+            .iter()
+            .map(|s| (s.ssrc, s.gain_milli as f32 / 1000.0))
+            .collect();
+        self.source_faders
+            .retain(|ssrc, _| live.iter().any(|(live, _)| live == ssrc));
+
+        for (ssrc, gain) in live {
+            if self.source_faders.contains_key(&ssrc) {
+                continue;
+            }
+            let state = gain_slider(gain, cx);
+            let subscription = cx.subscribe(&state, move |this, _, event: &SliderEvent, _| {
+                let SliderEvent::Change(value) = event;
+                this.set_source_gain(ssrc, single(*value));
+            });
+            self.source_faders.insert(
+                ssrc,
+                SourceFader {
+                    state,
+                    _subscription: subscription,
+                },
+            );
+        }
+    }
+
+    /// Applies the desk settings to a session that has just started. A new one
+    /// begins at unity by construction, which would silently undo a master
+    /// fader someone left down.
     fn push_desk_settings(&self) {
         if let Some(server) = &self.server {
             server.table().set_master_gain(self.master_gain);
@@ -245,8 +366,8 @@ impl LanMic {
         }
     }
 
-    fn port_from(&self, which: Field) -> Result<u16, String> {
-        let raw = self.field(which).value.trim();
+    fn port_from(input: &Entity<InputState>, cx: &App) -> Result<u16, String> {
+        let raw = Self::text(input, cx);
         raw.parse::<i32>()
             .ok()
             .and_then(|p| lanmic::net::validate_port(p).ok())
@@ -255,7 +376,7 @@ impl LanMic {
 
     // -- starting and stopping --------------------------------------------
 
-    pub(super) fn toggle_server(&mut self) {
+    pub(super) fn toggle_server(&mut self, cx: &mut Context<Self>) {
         if self.server.take().is_some() {
             return;
         }
@@ -265,14 +386,14 @@ impl LanMic {
         self.error = None;
 
         let mut config = self.options.server.clone();
-        match self.port_from(Field::ServerPort) {
+        match Self::port_from(&self.server_port, cx) {
             Ok(port) => config.port = port,
             Err(message) => {
                 self.error = Some(format!("port: {message}").into());
                 return;
             }
         }
-        let name = self.field(Field::ServerName).value.trim().to_string();
+        let name = Self::text(&self.server_name, cx);
         if !name.is_empty() {
             config.name = name;
         }
@@ -290,7 +411,7 @@ impl LanMic {
         }
     }
 
-    pub(super) fn toggle_mic(&mut self) {
+    pub(super) fn toggle_mic(&mut self, cx: &mut Context<Self>) {
         if self.mic.take().is_some() {
             return;
         }
@@ -298,12 +419,12 @@ impl LanMic {
         self.error = None;
 
         let mut config = self.options.mic.clone();
-        config.host = self.field(Field::MicHost).value.trim().to_string();
+        config.host = Self::text(&self.mic_host, cx);
         if config.host.is_empty() {
             self.error = Some("no server address: find one, or type it in".into());
             return;
         }
-        match self.port_from(Field::MicPort) {
+        match Self::port_from(&self.mic_port, cx) {
             Ok(port) => config.port = port,
             Err(message) => {
                 self.error = Some(format!("port: {message}").into());
@@ -332,12 +453,11 @@ impl LanMic {
             Panel::Microphone => self.server = None,
         }
         self.panel = panel;
-        self.focused = None;
         // Whatever went wrong was about the panel being left.
         self.error = None;
     }
 
-    pub(super) fn find_servers(&mut self, cx: &mut Context<Self>) {
+    pub(super) fn find_servers(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.searching {
             return;
         }
@@ -346,14 +466,16 @@ impl LanMic {
         self.found.clear();
 
         let port = self.options.server.discovery_port;
-        cx.spawn(async move |this, cx| {
+        // `spawn_in` rather than `spawn`: setting the address field on the way
+        // out goes through the input's own setter, which wants a window.
+        cx.spawn_in(window, async move |this, cx| {
             // A broadcast and a second of listening: off the UI thread, where
             // a second of anything is a second of a frozen window.
             let result = cx
                 .background_executor()
                 .spawn(async move { discovery::probe(port, DISCOVERY_WAIT) })
                 .await;
-            this.update(cx, |this, cx| {
+            this.update_in(cx, |this, window, cx| {
                 this.searching = false;
                 match result {
                     Ok(found) => {
@@ -362,7 +484,7 @@ impl LanMic {
                         }
                         // One answer is not a choice: take it.
                         if let [only] = found.as_slice() {
-                            this.field_mut(Field::MicHost).value = only.host();
+                            this.set_host(only.host(), window, cx);
                         }
                         this.found = found;
                     }
@@ -373,6 +495,14 @@ impl LanMic {
             .ok();
         })
         .detach();
+    }
+
+    /// Puts an address into the field, as picking one off the discovery list
+    /// does. Goes through the input's own setter so its cursor and undo
+    /// history stay consistent.
+    pub(super) fn set_host(&mut self, host: String, window: &mut Window, cx: &mut Context<Self>) {
+        self.mic_host
+            .update(cx, |state, cx| state.set_value(host, window, cx));
     }
 
     // -- controls ---------------------------------------------------------
@@ -445,164 +575,96 @@ impl LanMic {
         }
     }
 
-    /// Routes a drag to whichever slider owns it. `Down` claims the slider,
-    /// `Move` only moves the claimed one, `Up` releases it.
-    pub(super) fn slider_event(&mut self, id: SliderId, phase: DragPhase, at: f32) {
-        match phase {
-            DragPhase::Down => {
-                self.dragging = Some(id);
-                self.apply_slider(id, at);
-            }
-            DragPhase::Move => {
-                if self.dragging == Some(id) {
-                    self.apply_slider(id, at);
-                }
-            }
-            DragPhase::Up => {
-                if self.dragging == Some(id) {
-                    self.dragging = None;
-                }
-            }
-        }
-    }
-
-    fn apply_slider(&mut self, id: SliderId, at: f32) {
-        match id {
-            SliderId::MasterGain => self.set_master_gain(at * MAX_GAIN),
-            SliderId::FeedbackShift => self.set_feedback_hz(at * MAX_FEEDBACK_SHIFT_HZ),
-            SliderId::MicGain => self.set_mic_gain(at * MAX_GAIN),
-            SliderId::Source(ssrc) => self.set_source_gain(ssrc, at * MAX_GAIN),
-        }
-    }
-
-    // -- keyboard ---------------------------------------------------------
-
-    /// Takes no `Window` because it needs none - which is also what lets a test
-    /// drive it directly.
-    fn on_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
-        let Some(which) = self.focused else {
-            return;
-        };
-        if event.keystroke.key == "escape" {
-            self.focused = None;
-            cx.notify();
-            return;
-        }
-        match self.field_mut(which).key(&event.keystroke) {
-            FieldKey::Edited => {}
-            // Enter on an address or a port is "go", which is what someone who
-            // just typed one means by it.
-            FieldKey::Submitted => {
-                self.focused = None;
-                match self.panel {
-                    Panel::Mixer if self.server.is_none() => self.toggle_server(),
-                    Panel::Microphone if self.mic.is_none() => self.toggle_mic(),
-                    _ => {}
-                }
-            }
-            FieldKey::Ignored => return,
-        }
-        cx.notify();
-    }
-
     // -- chrome -----------------------------------------------------------
 
     fn tab(&self, panel: Panel, text: &'static str, cx: &mut Context<Self>) -> impl IntoElement {
-        button(text, text, ButtonKind::Toggle(self.panel == panel)).on_click(cx.listener(
-            move |this, _, _, cx| {
+        Button::new(text)
+            .label(text)
+            .ghost()
+            .small()
+            .selected(self.panel == panel)
+            .on_click(cx.listener(move |this, _, _, cx| {
                 this.show(panel);
                 cx.notify();
-            },
-        ))
+            }))
     }
 
-    /// The top row, which is also the titlebar. The name and the strapline are
-    /// one drag region that stretches to meet the tabs, so there is a generous
-    /// area to move the window by that never overlaps a control.
-    fn header(
-        &mut self,
-        decorations: Decorations,
-        window: &Window,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement {
+    /// The titlebar, which is also where the mode lives. `TitleBar` supplies
+    /// what a window needs and this platform may not: drag to move, double
+    /// click to maximise, right click for the window menu, and the
+    /// minimise/maximise/close buttons - drawn only where the desktop is not
+    /// drawing its own.
+    fn title_bar(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let live = self.is_live();
-        div()
-            .flex()
-            .flex_row()
-            .items_center()
-            .gap_2()
-            .child(frame::draggable(
-                div()
-                    .id("titlebar-drag")
-                    .flex()
-                    .flex_row()
-                    .flex_1()
-                    .items_baseline()
-                    .gap_2()
-                    .child(div().text_lg().text_color(rgb(TEXT)).child("LAN Mic"))
-                    .child(label("48 kHz mono, no codec")),
-                decorations,
-            ))
-            .child(self.tab(Panel::Mixer, "Mixer", cx))
-            .child(self.tab(Panel::Microphone, "Microphone", cx))
-            .child(
-                div()
-                    .px_2()
-                    .py_1()
-                    .rounded_md()
-                    .text_xs()
-                    .bg(rgb(if live { LIVE } else { PANEL_ALT }))
-                    .text_color(rgb(if live { 0x0d1f14 } else { MUTED }))
-                    .child(if live { "LIVE" } else { "idle" }),
-            )
-            .children(frame::controls(decorations, window))
+        TitleBar::new().child(
+            h_flex()
+                .w_full()
+                .items_center()
+                .gap_2()
+                .child(
+                    h_flex()
+                        .flex_1()
+                        .items_baseline()
+                        .gap_2()
+                        .child(div_text("LAN Mic"))
+                        .child(label("48 kHz mono, no codec")),
+                )
+                .child(self.tab(Panel::Mixer, "Mixer", cx))
+                .child(self.tab(Panel::Microphone, "Microphone", cx))
+                .child(
+                    gpui::div()
+                        .px_2()
+                        .py_1()
+                        .rounded_md()
+                        .text_xs()
+                        .bg(gpui::rgb(if live { LIVE } else { PANEL_ALT }))
+                        .text_color(gpui::rgb(if live { 0x0d1f14 } else { MUTED }))
+                        .child(if live { "LIVE" } else { "idle" }),
+                ),
+        )
     }
 
     fn error_bar(&self) -> Option<impl IntoElement> {
         self.error.clone().map(|message| {
-            div()
+            gpui::div()
                 .px_3()
                 .py_2()
                 .rounded_md()
-                .bg(rgb(0x2a1a1c))
+                .bg(gpui::rgb(0x2a1a1c))
                 .border_1()
-                .border_color(rgb(DANGER))
+                .border_color(gpui::rgb(DANGER))
                 .text_xs()
-                .text_color(rgb(DANGER))
+                .text_color(gpui::rgb(DANGER))
                 .child(message)
         })
     }
 }
 
+/// The app name, which is the one piece of text with a size of its own.
+fn div_text(text: &'static str) -> impl IntoElement {
+    gpui::div()
+        .text_lg()
+        .text_color(gpui::rgb(TEXT))
+        .child(text)
+}
+
 impl Render for LanMic {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // Everything drawn below comes from state the refresh tick collected in
         // `poll`, so one frame cannot disagree with itself about who is on the
         // desk - and so a test can put strips on the screen without a device.
-        let decorations = window.window_decorations();
-        let header = self.header(decorations, window, cx);
+        let title_bar = self.title_bar(cx);
         let panel = match self.panel {
             Panel::Mixer => self.render_mixer(cx).into_any_element(),
             Panel::Microphone => self.render_mic(cx).into_any_element(),
         };
 
-        // The shell is the window's own border and resize grip, and draws
-        // nothing at all where the platform provides them.
-        frame::shell(decorations).child(
-            div()
-                .id("root")
-                .track_focus(&self.focus)
-                .on_key_down(cx.listener(|this, event, _, cx| this.on_key(event, cx)))
-                .size_full()
-                .flex()
-                .flex_col()
+        v_flex().size_full().text_sm().child(title_bar).child(
+            v_flex()
+                .flex_1()
+                .min_h(px(0.))
                 .gap_3()
                 .p_4()
-                .bg(rgb(BG))
-                .text_color(rgb(TEXT))
-                .font_family("sans-serif")
-                .text_sm()
-                .child(header)
                 .children(self.error_bar())
                 .child(panel),
         )
@@ -614,9 +676,31 @@ pub(super) fn ms(frames: u32) -> f32 {
     frames as f32 * 1000.0 / SAMPLE_RATE as f32
 }
 
+/// Paints the component library with this app's palette, so a button and a
+/// channel strip belong to the same screen.
+fn apply_palette(cx: &mut App) {
+    Theme::change(ThemeMode::Dark, None, cx);
+    let theme = cx.global_mut::<Theme>();
+    theme.background = gpui::rgb(BG).into();
+    theme.foreground = gpui::rgb(TEXT).into();
+    theme.border = gpui::rgb(BORDER).into();
+    theme.muted_foreground = gpui::rgb(MUTED).into();
+    theme.primary = gpui::rgb(ACCENT).into();
+    theme.primary_hover = gpui::rgb(ACCENT).into();
+    theme.primary_active = gpui::rgb(ACCENT).into();
+    theme.primary_foreground = gpui::rgb(0xffffff).into();
+    theme.danger = gpui::rgb(DANGER).into();
+    theme.accent = gpui::rgb(PANEL_ALT).into();
+    theme.accent_foreground = gpui::rgb(TEXT).into();
+    theme.input = gpui::rgb(TRACK).into();
+    theme.title_bar = gpui::rgb(PANEL).into();
+    theme.title_bar_border = gpui::rgb(BORDER_STRONG).into();
+}
+
 pub fn run(options: Options) {
     Application::new().run(move |cx: &mut App| {
-        let bounds = Bounds::centered(None, size(px(1040.), px(720.)), cx);
+        gpui_component::init(cx);
+        apply_palette(cx);
         cx.on_window_closed(|cx| {
             if cx.windows().is_empty() {
                 cx.quit();
@@ -624,26 +708,38 @@ pub fn run(options: Options) {
         })
         .detach();
 
+        let bounds = Bounds::centered(None, size(px(1040.), px(720.)), cx);
         let opened = cx.open_window(
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
                 titlebar: Some(TitlebarOptions {
                     title: Some("LAN Mic".into()),
+                    appears_transparent: true,
                     ..Default::default()
                 }),
                 window_min_size: Some(size(px(880.), px(560.))),
                 app_id: Some("com.lanmic.audio".into()),
+                // Transparent, because the frame `Root` draws has a shadow
+                // outside the window's own edge to drop it onto.
+                window_background: WindowBackgroundAppearance::Transparent,
                 // Linux only, and ignored elsewhere. Asking for client-side
                 // decorations is what makes GNOME's Wayland session - which
                 // does not implement the server-side protocol at all - report
-                // `Decorations::Client` so `frame` knows to draw a titlebar
-                // instead of leaving a window with no way to move or close it.
-                // X11 without a compositor refuses and falls back to the
-                // window manager's own, which is the right answer there.
+                // `Decorations::Client`, so the frame is drawn rather than
+                // leaving a window with no way to move or close it. X11
+                // without a compositor refuses and falls back to the window
+                // manager's own, which is the right answer there.
                 window_decorations: Some(WindowDecorations::Client),
                 ..Default::default()
             },
-            |window, cx| cx.new(|cx| LanMic::new(options, window, cx)),
+            |window, cx| {
+                let view: gpui::AnyView = cx.new(|cx| LanMic::new(options, window, cx)).into();
+                // `Root` is the component library's window shell: it draws the
+                // border, the shadow and the resize edges on the platforms
+                // that leave them to the application, and hosts anything that
+                // has to float above the view.
+                cx.new(|cx| Root::new(view, window, cx))
+            },
         );
         if let Err(e) = opened {
             // No display, no GPU, no Wayland or X11 socket: say which way out
@@ -662,13 +758,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn every_field_has_its_own_slot() {
-        let mut seen: Vec<usize> = Field::ALL.iter().map(|f| f.index()).collect();
-        seen.sort_unstable();
-        assert_eq!(seen, [0, 1, 2, 3]);
-    }
-
-    #[test]
     fn frames_become_the_milliseconds_the_ui_shows() {
         assert_eq!(ms(240), 5.0);
         assert_eq!(ms(720), 15.0);
@@ -685,6 +774,12 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn a_slider_reports_one_value_however_it_is_shaped() {
+        assert_eq!(single(SliderValue::Single(0.75)), 0.75);
+        assert_eq!(single(SliderValue::Range(0.1, 0.9)), 0.9);
+    }
 }
 
 /// Render tests.
@@ -695,26 +790,41 @@ mod tests {
 /// with no GPU - which is what catches the thing the type checker cannot,
 /// namely anything in `render` that panics or fails to lay out.
 ///
-/// What it does not do is look at pixels. A control drawn the wrong colour, or
-/// off the bottom of the window, still needs eyes.
+/// What it does not do is look at pixels. A control drawn the wrong colour
+/// still needs eyes. It does measure them, though: see
+/// [`a_reading_that_grows_does_not_move_the_row`], which is the test for the
+/// fixed-width readouts rather than for any of the code that draws them.
 #[cfg(test)]
 mod render_tests {
     use super::*;
-    use gpui::{Entity, Keystroke, Modifiers, TestAppContext, VisualTestContext};
+    use gpui::{Entity, TestAppContext, VisualTestContext};
+    use gpui_component::input::InputEvent;
     use lanmic::mixer::MAX_SOURCES;
 
     fn open(cx: &mut TestAppContext) -> (Entity<LanMic>, &mut VisualTestContext) {
+        cx.update(|cx| {
+            // The component library keeps its theme in a global, and every one
+            // of its components reads it while rendering.
+            gpui_component::init(cx);
+            apply_palette(cx);
+        });
         let (view, cx) =
             cx.add_window_view(|window, cx| LanMic::new(Options::default(), window, cx));
         cx.run_until_parked();
         (view, cx)
     }
 
-    fn typed(key: &str) -> Keystroke {
-        Keystroke {
-            modifiers: Modifiers::default(),
-            key: key.to_string(),
-            key_char: Some(key.to_string()),
+    fn source(ssrc: u32, buffer_frames: u32, packets: u32) -> SourceSnapshot {
+        SourceSnapshot {
+            ssrc,
+            peak_milli: 500,
+            buffer_frames,
+            packets,
+            lost: 0,
+            underruns: 0,
+            age_ms: 10,
+            muted: false,
+            gain_milli: 1000,
         }
     }
 
@@ -739,22 +849,12 @@ mod render_tests {
         let (view, cx) = open(cx);
 
         // Eight strips - a full table - each with its own meter, fader, mute
-        // button, drag-tracking canvas and counters. This is the densest thing
-        // the window ever draws and the only part of it that is built in a
-        // loop, so it is where a layout bug would land.
+        // button and counters. This is the densest thing the window ever
+        // draws and the only part built in a loop, so it is where a layout
+        // bug would land.
         view.update(cx, |this, cx| {
             this.sources = (0..MAX_SOURCES)
-                .map(|i| SourceSnapshot {
-                    ssrc: 0x1000 + i as u32,
-                    peak_milli: 250 * i as u32,
-                    buffer_frames: 720,
-                    packets: 100,
-                    lost: i as u32,
-                    underruns: 0,
-                    age_ms: if i == 0 { 400 } else { 10 },
-                    muted: i % 3 == 0,
-                    gain_milli: 1000,
-                })
+                .map(|i| source(0x1000 + i as u32, 720, 100))
                 .collect();
             cx.notify();
         });
@@ -764,7 +864,7 @@ mod render_tests {
         // And the tick takes them away again when there is no session behind
         // them, which is the other state the strip list has to survive.
         view.update(cx, |this, cx| {
-            this.poll();
+            this.poll(cx);
             cx.notify();
         });
         cx.run_until_parked();
@@ -782,78 +882,90 @@ mod render_tests {
         view.update(cx, |this, _| assert!(this.error.is_some()));
     }
 
+    /// The reason the readouts have fixed widths.
+    ///
+    /// A buffer depth crossing from `9 ms` to `10 ms` is one character wider.
+    /// In a plain flex row that pushes every reading after it - and the mute
+    /// button beyond them - a few pixels sideways, several times a second,
+    /// for as long as the mixer is running. This renders the same strip eight
+    /// ways and requires the end of the row to land on the same pixel every
+    /// time.
     #[gpui::test]
-    fn typing_reaches_the_focused_field(cx: &mut TestAppContext) {
+    fn a_reading_that_grows_does_not_move_the_row(cx: &mut TestAppContext) {
         let (view, cx) = open(cx);
 
+        let mut positions = Vec::new();
+        // 9 ms and 10 ms; one packet and a million.
+        for (buffer_frames, packets) in [
+            (432, 1),
+            (480, 1),
+            (432, 1_000_000),
+            (480, 1_000_000),
+            (9600, 999),
+            (240, 12),
+            (720, 123_456),
+            (48, 7),
+        ] {
+            view.update(cx, |this, cx| {
+                this.sources = vec![source(0x1234, buffer_frames, packets)];
+                cx.notify();
+            });
+            cx.run_until_parked();
+            positions.push((
+                buffer_frames,
+                packets,
+                cx.debug_bounds(mixer::STRIP_TAIL)
+                    .expect("the strip's last reading should have been drawn"),
+            ));
+        }
+
+        let (_, _, first) = positions[0];
+        for (buffer_frames, packets, bounds) in &positions {
+            assert_eq!(
+                bounds.origin, first.origin,
+                "the row moved at buf={buffer_frames} pkts={packets}"
+            );
+            assert_eq!(
+                bounds.size, first.size,
+                "the row changed width at buf={buffer_frames} pkts={packets}"
+            );
+        }
+    }
+
+    #[gpui::test]
+    fn enter_in_the_address_field_tries_to_start(cx: &mut TestAppContext) {
+        let (view, cx) = open(cx);
         view.update(cx, |this, cx| {
             this.show(Panel::Microphone);
-            this.focused = Some(Field::MicHost);
-            this.field_mut(Field::MicHost).value.clear();
             cx.notify();
         });
         cx.run_until_parked();
 
-        view.update(cx, |this, cx| {
-            for key in ["1", "0", ".", "1"] {
-                this.on_key(
-                    &KeyDownEvent {
-                        keystroke: typed(key),
-                        is_held: false,
-                    },
-                    cx,
-                );
-            }
+        // The field is empty, so the attempt has to fail loudly rather than
+        // quietly starting a microphone pointed at nowhere.
+        let host = view.read_with(cx, |this, _| this.mic_host.clone());
+        host.update(cx, |_, cx| {
+            cx.emit(InputEvent::PressEnter { secondary: false });
         });
         cx.run_until_parked();
+
         view.update(cx, |this, _| {
-            assert_eq!(this.field(Field::MicHost).value, "10.1");
+            assert!(this.mic.is_none());
+            assert!(this.error.is_some(), "an empty address should say so");
         });
     }
 
     #[gpui::test]
-    fn escape_gives_up_the_field_and_enter_starts_the_session(cx: &mut TestAppContext) {
+    fn an_address_typed_into_the_field_is_what_gets_dialled(cx: &mut TestAppContext) {
         let (view, cx) = open(cx);
-
-        view.update(cx, |this, cx| {
-            this.show(Panel::Microphone);
-            this.focused = Some(Field::MicHost);
-            this.on_key(
-                &KeyDownEvent {
-                    keystroke: Keystroke {
-                        modifiers: Modifiers::default(),
-                        key: "escape".into(),
-                        key_char: None,
-                    },
-                    is_held: false,
-                },
-                cx,
-            );
-        });
-        view.update(cx, |this, _| assert_eq!(this.focused, None));
-
-        // Enter on an empty address is a start attempt, and a start attempt
-        // with no address is the error banner rather than a live session.
-        view.update(cx, |this, cx| {
-            this.focused = Some(Field::MicHost);
-            this.field_mut(Field::MicHost).value.clear();
-            this.on_key(
-                &KeyDownEvent {
-                    keystroke: Keystroke {
-                        modifiers: Modifiers::default(),
-                        key: "enter".into(),
-                        key_char: None,
-                    },
-                    is_held: false,
-                },
-                cx,
-            );
+        let host = view.read_with(cx, |this, _| this.mic_host.clone());
+        cx.update_window_entity(&host, |state, window, cx| {
+            state.set_value("192.168.1.50", window, cx);
         });
         cx.run_until_parked();
-        view.update(cx, |this, _| {
-            assert_eq!(this.focused, None);
-            assert!(this.mic.is_none());
-            assert!(this.error.is_some(), "an empty address should say so");
+
+        view.update(cx, |this, cx| {
+            assert_eq!(LanMic::text(&this.mic_host, cx), "192.168.1.50");
         });
     }
 }

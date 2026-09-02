@@ -87,9 +87,10 @@ supplies and no more: audio streams, and a UI.
 | `engine.rs` | `Server` and `Microphone`: `android.rs` with cpal streams. Same supervisor, same threads, same `*Shared` atomics. |
 | `discovery.rs` | DISCOVER/ANNOUNCE, both halves, encoded with `lanmic::protocol`. |
 | `console.rs` | The `--headless` status line, for a machine in a rack. |
-| `ui/` | The GPUI window: `mod.rs` the view and its state, `mixer.rs` and `mic.rs` the two panels, `frame.rs` the window frame, `widgets.rs` meter/slider/field, `theme.rs` colours. |
+| `ui/` | The GPUI window: `mod.rs` the view and its state, `mixer.rs` and `mic.rs` the two panels, `widgets.rs` the peak meter and the readouts, `theme.rs` colours. |
 
-Extra dependencies over the engine's: `gpui`, `cpal`, `clap`, `if-addrs`, `env_logger`.
+Extra dependencies over the engine's: `gpui`, `gpui-component`, `cpal`, `clap`,
+`if-addrs`, `env_logger`.
 
 **The engine is not modified for the desktop.** The desktop's whole job is to
 push `i16` into `CaptureEncoder::push` and pull `f32` out of `Mixer::render`;
@@ -171,29 +172,60 @@ Mutter does not implement it at all, so an application that asks for
 server-side decorations there gets a bare rectangle with no way to move,
 resize or close it.
 
-GPUI reports which of the two is in effect - `Decorations::Server` or
-`Decorations::Client { tiling }` - and `ui/frame.rs` draws the second case: a
-border, a titlebar that moves the window on a drag, maximises on a double
-click and raises the compositor's menu on a right click, minimise/maximise/
-close buttons, and a six-pixel grab zone with the right cursor for each edge
-and corner. Under `Server` it draws nothing.
+So the window asks for client-side decorations, and `gpui-component` draws
+them: its `Root` is the window shell - border, shadow, rounded corners and
+the resize edges with a cursor for each - and its `TitleBar` carries the drag
+to move, the double click to maximise, the right click for the compositor's
+menu, and the minimise/maximise/close buttons. Both check
+`window.window_decorations()` and draw nothing under `Decorations::Server`, so
+macOS and Windows keep their native titlebars rather than growing a second row
+of buttons.
 
-Two details that are not obvious:
+The request is Linux-only; macOS and Windows ignore it. X11 honours it only
+where a compositor supports it and otherwise falls back to the window
+manager's own, logging that it did.
 
-* **The content is inset by the grab zone rather than drawn under it.** A
-  master fader that reached the window edge would otherwise have to compete
-  with a resize for the same drag.
-* **`tiling` says which edges are snapped against something.** Those get no
-  rounding, no border and no resize handle, because a window filling the left
-  half of the screen has no left edge to drag and rounding it would draw a
-  seam down the middle of the display.
+### Why the UI is a component library plus a meter
 
-The window asks for client-side decorations rather than letting the default
-stand, because the default is to ask for server-side ones - which is precisely
-the case Mutter ignores. The option is Linux-only; macOS and Windows ignore it
-and keep their native titlebars. X11 honours it only where a compositor
-supports it and otherwise falls back to the window manager's own, logging that
-it did.
+The first version of this window hand-rolled its own button, slider and text
+field, because GPUI ships elements and layout rather than components. The
+slider was a canvas, a hitbox and a three-phase drag state machine on the
+view; the text field was printable characters and backspace, with a `focused`
+field on the view routing keys to one of four of them, and no selection, no
+clipboard and no IME.
+
+`gpui-component` pins the same `gpui` this crate does, so its components are
+the same types. Adopting it deleted all of that: a slider is an
+`Entity<SliderState>` that emits `SliderEvent`, a field is an
+`Entity<InputState>` that emits `InputEvent`, and the view subscribes rather
+than tracking drags and keystrokes. The window frame went the same way.
+
+What stayed is the part that is about audio rather than about widgets: the
+peak meter, whose colour is a function of how close the level is to clipping,
+and the fixed-width readouts described below. The theme is still this crate's
+- `apply_palette` writes the palette in `theme.rs` into the library's own
+theme, so a button and a channel strip belong to the same screen.
+
+### Why every number is in a fixed-width box
+
+Every readout on the mixer changes several times a second, and some of them
+change width when they do: a buffer depth going from `9 ms` to `10 ms`, a
+packet count reaching ten thousand. In a flex row a wider child pushes
+everything after it along, so a mixer left running would have its mute buttons
+twitching sideways all evening - which is exactly as distracting as it sounds
+when the meters beside them are the thing you are trying to read.
+
+So a number is never laid out by its own width. `widgets::readout` puts it in
+a box wide enough for the widest value it can reach and lets it grow inside
+that box; `stat` pairs one with its label; `readings` is a row of them. The
+widths are the `W_*` constants, and a test asserts each is wide enough for the
+widest string it will be asked to hold.
+
+There is a layout test for the effect rather than the mechanism: a channel
+strip is rendered with a two-character buffer reading and again with three,
+and the last reading in the row has to land on the same pixel both times.
+
+### Why the audio-thread state sits behind a `Mutex`
 
 ### Why the audio-thread state sits behind a `Mutex`
 
@@ -299,10 +331,6 @@ Real, understood, and deliberately not fixed.
   than rate-converted behind your back. On Linux that is rarely a real
   restriction: PulseAudio and PipeWire both offer 48 kHz whatever the hardware
   is doing underneath.
-* **The desktop UI's text fields are the small half of a text input.**
-  Printable characters, backspace, Ctrl-U and Enter. No selection, no
-  clipboard, no IME - three short fields did not justify the seven hundred
-  lines GPUI's own example spends on a real one.
 * **Starting a desktop session blocks the UI thread** for as long as the
   backend takes to open a stream. That is milliseconds on a working device and
   up to the two-second open timeout on a wedged one.

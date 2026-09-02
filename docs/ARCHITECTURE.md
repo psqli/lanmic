@@ -87,7 +87,7 @@ supplies and no more: audio streams, and a UI.
 | `engine.rs` | `Server` and `Microphone`: `android.rs` with cpal streams. Same supervisor, same threads, same `*Shared` atomics. |
 | `discovery.rs` | DISCOVER/ANNOUNCE, both halves, encoded with `lanmic::protocol`. |
 | `console.rs` | The `--headless` status line, for a machine in a rack. |
-| `ui/` | The GPUI window: `mod.rs` the view and its state, `mixer.rs` and `mic.rs` the two panels, `widgets.rs` meter/slider/field, `theme.rs` colours. |
+| `ui/` | The GPUI window: `mod.rs` the view and its state, `mixer.rs` and `mic.rs` the two panels, `frame.rs` the window frame, `widgets.rs` meter/slider/field, `theme.rs` colours. |
 
 Extra dependencies over the engine's: `gpui`, `cpal`, `clap`, `if-addrs`, `env_logger`.
 
@@ -161,6 +161,40 @@ cpal also distinguishes failures Oboe does not, and the desktop side is less
 blunt because of it: an `Xrun` is a counter, a `DeviceChanged` reroute and a
 `RealtimeDenied` are log lines, and only the rest ask for a new stream.
 
+### Why the app draws its own titlebar
+
+A window needs three things a program cannot supply on its own: somewhere to
+drag it by, edges to resize it by, and a button to close it. On macOS, on
+Windows, and on X11 under a window manager, the platform draws them. On
+Wayland it may not: the `xdg-decoration` protocol is optional and GNOME's
+Mutter does not implement it at all, so an application that asks for
+server-side decorations there gets a bare rectangle with no way to move,
+resize or close it.
+
+GPUI reports which of the two is in effect - `Decorations::Server` or
+`Decorations::Client { tiling }` - and `ui/frame.rs` draws the second case: a
+border, a titlebar that moves the window on a drag, maximises on a double
+click and raises the compositor's menu on a right click, minimise/maximise/
+close buttons, and a six-pixel grab zone with the right cursor for each edge
+and corner. Under `Server` it draws nothing.
+
+Two details that are not obvious:
+
+* **The content is inset by the grab zone rather than drawn under it.** A
+  master fader that reached the window edge would otherwise have to compete
+  with a resize for the same drag.
+* **`tiling` says which edges are snapped against something.** Those get no
+  rounding, no border and no resize handle, because a window filling the left
+  half of the screen has no left edge to drag and rounding it would draw a
+  seam down the middle of the display.
+
+The window asks for client-side decorations rather than letting the default
+stand, because the default is to ask for server-side ones - which is precisely
+the case Mutter ignores. The option is Linux-only; macOS and Windows ignore it
+and keep their native titlebars. X11 honours it only where a compositor
+supports it and otherwise falls back to the window manager's own, logging that
+it did.
+
 ### Why the audio-thread state sits behind a `Mutex`
 
 `oboe` takes the data callback by value and boxes it, and never reclaims that
@@ -232,7 +266,11 @@ conversions, the discovery exchange over a loopback socket, the command line,
 the stream-error classification, and the text field's key handling — plus the
 UI itself. GPUI ships a test platform with a real window, layout pass and paint
 pass and no display behind any of it, so `render` runs under `cargo test` on
-both panels, on a full desk of eight strips, and on the error banner. That
+both panels, on a full desk of eight strips, and on the error banner. That test
+platform always reports server-side decorations, so everything in `frame.rs`
+takes the decoration mode as an argument rather than reading it from the
+window, and a harness view renders the client-side branch - the one a GNOME
+session takes - in CI, where no compositor will ever offer it. That
 catches anything in the render path that panics or fails to lay out; it does
 not look at pixels, so a control drawn the wrong colour still needs eyes.
 
@@ -270,6 +308,13 @@ Real, understood, and deliberately not fixed.
   up to the two-second open timeout on a wedged one.
 * **The desktop UI's appearance is not tested.** The render tests prove the
   tree lays out; nothing checks that it looks right.
+* **Client-side decorations are asked for on every Linux session, not just the
+  ones that need them.** On X11 under a compositor that supports CSD, that
+  means the app's own titlebar rather than the window manager's - so its
+  theming, and any window-manager gesture bound to a real titlebar, are lost.
+  The alternative is sniffing `WAYLAND_DISPLAY` to guess the backend, which
+  is a guess; one appearance on every Linux desktop is the more predictable
+  trade.
 * **Clock drift is shed, not tracked.** The trim drops the oldest audio every
   few minutes instead of resampling to the receiver's clock.
 * **The C++ runtime is linked statically.** `oboe-sys` pulls in

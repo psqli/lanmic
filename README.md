@@ -21,9 +21,13 @@ Two modes in one APK:
 2. **Mixer / server** — receives from up to 8 microphones, runs one jitter
    buffer per source, sums them, limits the bus, and plays out through AAudio.
 
-A Python server (`server/lan_audio_server.py`) speaks the same protocol, so a
-laptop can be the mixer instead — usually the better choice when you want to
-feed a real interface or a house console.
+A desktop app (`desktop/`) is the same two modes again for Linux, macOS and
+Windows: the identical Rust engine, with cpal where the phone has Oboe and a
+GPUI window where it has Compose. A Python server
+(`server/lan_audio_server.py`) speaks the same protocol as a second,
+independent implementation. Either way, a laptop can be the mixer instead —
+usually the better choice when you want to feed a real interface or a house
+console.
 
 Typical end-to-end delay is **33–47 ms**. The wire format and the latency
 budget are in [PROTOCOL.md](PROTOCOL.md); how the code is put together is in
@@ -35,14 +39,26 @@ budget are in [PROTOCOL.md](PROTOCOL.md); how the code is put together is in
   laptop (mic) ─┘                    (phone or laptop)
 ```
 
+Three front ends, one engine:
+
+```
+        Android app            desktop app            Python server
+        Compose UI             GPUI window            terminal
+        Oboe streams           cpal streams           sounddevice
+             └──────── rust/ (the LAU1 engine) ────────┘        │
+                                                    a separate implementation
+                                                    of the same wire format
+```
+
 ## Layout
 
 ```
 rust/                   audio engine: protocol, jitter buffers, mixer, UDP,
-                        the Oboe streams and the JNI surface
+                        the stream supervisor, the Oboe streams, the JNI surface
 app/src/main/java/      Kotlin UI, foreground service, discovery
-server/                 desktop mixing server + a test transmitter
-tools/                  test runner for both suites
+desktop/                the same engine behind cpal and a GPUI window
+server/                 Python mixing server + a test transmitter
+tools/                  test runner for every suite
 PROTOCOL.md             wire format, jitter strategy, latency budget
 docs/ARCHITECTURE.md    module map, threading model, invariants
 ```
@@ -77,12 +93,53 @@ coffee; after that it is incremental.
 
 No local Android SDK? Push the repo to GitHub and
 `.github/workflows/android.yml` builds `app-debug.apk` for you and uploads it as
-a workflow artifact - it also runs both test suites on every push.
+a workflow artifact - it also runs every test suite on every push.
 
 `minSdk` is 26. AAudio's low-latency MMAP path arrives properly in API 27+; on
 older devices Oboe falls back to OpenSL ES and capture latency roughly doubles.
 
-## Run the desktop server
+## Run the desktop app
+
+```bash
+cd desktop
+cargo run --release                     # the window: mixer and microphone
+cargo run --release -- --list-devices   # what this machine has
+```
+
+The window has the same two modes as the phone. **Mixer** binds the audio port,
+answers discovery so a phone's *Find server* lands on it, and gives you a
+channel strip per microphone with a meter, a fader, a mute, and that source's
+buffer depth and loss counters — plus the master fader, the feedback shifter and
+the limiter's gain reduction. **Microphone** finds a mixer (or takes an address
+typed in), picks an input, and ships.
+
+No screen, or no GPU for GPUI to talk to? The same binary runs on a terminal:
+
+```bash
+cargo run --release -- --headless --jitter 15 --output "USB Audio"
+cargo run --release -- --headless --mic 192.168.1.50 --input "Scarlett"
+```
+
+Flags mirror the Python server's where they overlap: `--port`, `--jitter`,
+`--blocksize`, `--name`, `--discovery-port`, `--no-discovery`, plus `--output`
+and `--input` (a substring of the device name is enough), `--mic HOST` and
+`--packet`. `lanmic --help` lists them all.
+
+On Linux the build needs ALSA and the GPUI system libraries:
+
+```bash
+sudo apt install libasound2-dev libxkbcommon-dev libxkbcommon-x11-dev \
+                 libwayland-dev libx11-dev libxcb1-dev libfontconfig1-dev
+```
+
+Everything runs at 48 kHz with no resampler anywhere, so a device that will not
+do 48 kHz is listed as unusable rather than quietly rate-converted. On Linux
+PulseAudio and PipeWire both offer 48 kHz whatever the hardware is doing.
+
+## Run the Python server
+
+A second implementation of the mixer half, useful for the same job and for
+keeping the protocol honest.
 
 ```bash
 cd server
@@ -94,7 +151,7 @@ python3 lan_audio_server.py --jitter 15 --device 3 --blocksize 240
 Useful flags: `--jitter` (buffer target, ms), `--blocksize` (output block in
 frames; 240 = 5 ms), `--channels`, `--gain`, `--port`, `--no-discovery`.
 
-Send it a test tone without touching a phone:
+Send either server a test tone without touching a phone:
 
 ```bash
 python3 test_mic_client.py --tone 440          # finds the server by broadcast
@@ -103,8 +160,8 @@ python3 test_mic_client.py --host 192.168.1.50 --mic
 
 ## Using it at a venue
 
-1. Start the mixer first (app in **Mixer / server** mode, or the Python server).
-   The Android screen shows the IP addresses it is listening on.
+1. Start the mixer first (phone in **Mixer / server** mode, the desktop app, or
+   the Python server). All three show the IP addresses they are listening on.
 2. On each microphone phone: **Find server**, or type the address, then **GO
    LIVE**. Grant the microphone permission once.
 3. Speak. The mixer lists each microphone with a level meter, its current
@@ -170,21 +227,24 @@ The threading model and the invariants behind these choices are written up in
 ## Tests
 
 ```bash
-tools/run_tests.sh              # Rust engine + Python server
+tools/run_tests.sh              # engine + desktop app + Python server
 tools/run_tests.sh --strict     # the same, plus rustfmt and clippy
 ```
 
 `cargo test` covers everything except the two Oboe streams, including an
 end-to-end suite that runs a ramp from the capture encoder, over a real
 loopback socket, through the jitter buffers and out of the mixer, and checks it
-sample by sample. No device required. The Python suite covers the same
-behaviours in `lan_audio_server.py`, so the two implementations stay in step.
-CI runs both on every push.
+sample by sample. No device required. The desktop crate's own suite covers
+everything in it that is not a cpal stream or a GPUI element: device-config
+selection, the format conversions, the discovery exchange over loopback, the
+command line, and the text field. The Python suite covers the same behaviours
+as the engine in `lan_audio_server.py`, so the two implementations stay in
+step. CI runs all three on every push.
 
 ## Limits
 
-* 8 simultaneous microphones on the Android mixer (`MAX_SOURCES` in
-  `rust/src/mixer.rs`).
+* 8 simultaneous microphones on any mixer running the Rust engine
+  (`MAX_SOURCES` in `rust/src/mixer.rs`).
 * Mono on the wire; the mixer plays the same mix to every output channel.
 * No encryption and no authentication. Anyone on the LAN can send audio to the
   mixer. Use a private AP.

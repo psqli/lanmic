@@ -9,8 +9,11 @@ keep the audio path from glitching. For the wire format see
 
 One APK contains both ends. A phone is either a **microphone** (capture → UDP)
 or a **mixer** (UDP → jitter buffers → sum → speaker), never both at once. The
-Python server is a second, independent implementation of the mixer half that
-speaks the same protocol.
+desktop app in `desktop/` is the same two ends again, linking the same engine
+crate with cpal streams and a GPUI window in place of Oboe and Compose. The
+Python server is a second, *independent* implementation of the mixer half that
+speaks the same protocol - deliberately not a port, so the wire format has two
+readings of it.
 
 ```
 MICROPHONE                                   MIXER
@@ -30,9 +33,11 @@ logging live on ordinary threads.
 
 ### Engine — `rust/`
 
-One crate. Everything except `android.rs` and `bridge.rs` is portable, which is
-what lets `cargo test` exercise the whole path - capture, packetise, socket,
-conceal, mix - on a desktop, with no device and no Oboe.
+One crate, linked two ways: as a `cdylib` the APK loads, and as an `rlib` the
+desktop binary links. Everything except `android.rs` and `bridge.rs` is
+portable, which is what lets `cargo test` exercise the whole path - capture,
+packetise, socket, conceal, mix - on a desktop with no device and no Oboe, and
+what lets the desktop front-end be a front-end rather than a second engine.
 
 | File | What it is |
 |---|---|
@@ -45,6 +50,7 @@ conceal, mix - on a desktop, with no device and no Oboe.
 | `util.rs` | Monotonic clock, milli-unit atomics, best-effort thread priority. |
 | `transmitter.rs` | `CaptureEncoder` (downmix, gain, meter) and `Packetiser` (ring → wire). Portable. |
 | `receiver.rs` | `PacketRouter` (socket → source table) and the stereo interleave. Portable. |
+| `supervisor.rs` | The one-thread-owns-one-stream lifecycle, shared by the Oboe and cpal front-ends. Portable. |
 | `android.rs` | The two Oboe streams and the threads around them. The only device-specific code. |
 | `bridge.rs` | The whole JNI surface. Two engines behind two mutexes. |
 | `build.rs` | Android link configuration: `libc++abi`, and `-Wl,--no-undefined` so a missing symbol fails the build instead of `dlopen`. |
@@ -67,7 +73,29 @@ streams, `jni`, and `log`/`android_logger`.
 | `AudioService.kt` | Foreground service; holds the Wi-Fi and wake locks. |
 | `Net.kt` | Local IPv4 address enumeration. |
 
-### Desktop server — `server/`
+### Desktop app — `desktop/`
+
+A separate crate with a path dependency on `rust/`, so `rust/` keeps its own
+lockfile and the Gradle build that reads it. It supplies exactly what a phone
+supplies and no more: audio streams, and a UI.
+
+| File | What it is |
+|---|---|
+| `main.rs` | Mode selection: window, `--headless` mixer, `--headless --mic`, `--list-devices`. |
+| `args.rs` | The command line: a `clap` derive struct, and the mapping from it onto the two config structs. Flags match `lan_audio_server.py` where they overlap. |
+| `audio.rs` | cpal: device enumeration, 48 kHz config selection, and the four format conversions between cpal buffers and what the engine takes. |
+| `engine.rs` | `Server` and `Microphone`: `android.rs` with cpal streams. Same supervisor, same threads, same `*Shared` atomics. |
+| `discovery.rs` | DISCOVER/ANNOUNCE, both halves, encoded with `lanmic::protocol`. |
+| `console.rs` | The `--headless` status line, for a machine in a rack. |
+| `ui/` | The GPUI window: `mod.rs` the view and its state, `mixer.rs` and `mic.rs` the two panels, `widgets.rs` meter/slider/field, `theme.rs` colours. |
+
+Extra dependencies over the engine's: `gpui`, `cpal`, `clap`, `if-addrs`, `env_logger`.
+
+**The engine is not modified for the desktop.** The desktop's whole job is to
+push `i16` into `CaptureEncoder::push` and pull `f32` out of `Mixer::render`;
+everything between those two calls is the code the phone runs.
+
+### Desktop server (Python) — `server/`
 
 `lan_audio_server.py` mirrors the receive half in Python: `Source` is the
 jitter buffer, `Limiter` the bus limiter, `Server` the network/audio/discovery
@@ -81,14 +109,14 @@ Six threads matter. Nothing else may touch the marked structures.
 
 | Thread | Owns | Never does |
 |---|---|---|
-| Oboe input callback | `CaptureEncoder` (the ring's write half) | Syscalls, allocation, blocking |
+| Input callback (Oboe / cpal) | `CaptureEncoder` (the ring's write half) | Syscalls, allocation, blocking |
 | Sender | `Packetiser`: seq, timestamp, the socket | Blocking sends (the socket is non-blocking) |
-| Oboe output callback | `Mixer`: every jitter buffer's read half, the scratch buffers, the `Limiter` | Syscalls, allocation, blocking |
+| Output callback (Oboe / cpal) | `Mixer`: every jitter buffer's read half, the scratch buffers, the `Limiter` | Syscalls, allocation, blocking |
 | Network (mixer) | `PacketRouter`: every jitter buffer's write half, slot lifecycle | Blocking on the audio thread |
 | Stream supervisor | The Oboe stream itself, and nothing else does | Touching audio data |
 | Discovery | Its own socket | Anything on the audio path |
-| Service worker | `AudioService` locks, responder, engine start/stop | Nothing - but it is the *only* thread allowed to do them |
-| UI / JNI | Reads counters through relaxed atomics | Blocking (stat calls use `try_lock`) |
+| Service worker (Android) | `AudioService` locks, responder, engine start/stop | Nothing - but it is the *only* thread allowed to do them |
+| UI (Compose / GPUI) | Reads counters through relaxed atomics | Blocking (stat calls use `try_lock`) |
 
 **This table is documentation of what the types already enforce.** Every
 lock-free buffer is split into a writer half and a reader half that are
@@ -114,16 +142,24 @@ stop tears its own engine back down.
 
 ### Why one thread owns each audio stream
 
-Opening, starting and closing an audio stream is done by a supervisor thread
-and by nothing else, from `start` through to `stop`, including reopening after
-a device change. Two live input streams would be two producers on a
+`supervisor.rs`, used by both front-ends. Opening, starting and closing an audio
+stream is done by a supervisor thread and by nothing else, from `start` through
+to `stop`, including reopening after a device change. Two live input streams would be two producers on a
 single-producer ring; two live output streams would be two readers. Because
 only one thread can install a stream, that is not a race to be guarded against
 with generation counters - it is a state that cannot be constructed.
 
-The supervisor also polls the stream for xruns and latency on its 200 ms tick,
-and retries a failed reopen with backoff rather than giving up once and leaving
-a live session with dead audio.
+The supervisor also polls the stream for whatever the backend will tell it on
+its 200 ms tick, and retries a failed reopen with backoff rather than giving up
+once and leaving a live session with dead audio. What that poll yields differs:
+Oboe answers `getXRunCount` and `calculateLatencyMillis` on demand, while cpal
+reports a dropout as an `ErrorKind::Xrun` on the error callback and gives
+latency as a per-callback timestamp pair. Both end up in the same two atomics,
+so the same UI reads them.
+
+cpal also distinguishes failures Oboe does not, and the desktop side is less
+blunt because of it: an `Xrun` is a counter, a `DeviceChanged` reroute and a
+`RealtimeDenied` are log lines, and only the rest ask for a new stream.
 
 ### Why the audio-thread state sits behind a `Mutex`
 
@@ -184,11 +220,26 @@ tools/run_tests.sh --strict     # also rustfmt and clippy, as CI does
 ```
 
 `cargo test` covers everything except the two Oboe streams — protocol, jitter
-buffer, meter, mixer, limiter, sockets, and an end-to-end suite that runs a
-ramp from the capture encoder, over a real loopback socket, through the router
-and out of the mixer, sample-accurate. `test_python_server.py` covers the same
-behaviours in the Python implementation, so the two stay in step. CI runs
-both on every push, and builds the APK.
+buffer, meter, mixer, limiter, sockets, the stream supervisor, and an
+end-to-end suite that runs a ramp from the capture encoder, over a real
+loopback socket, through the router and out of the mixer, sample-accurate.
+`test_python_server.py` covers the same behaviours in the Python
+implementation, so the two stay in step.
+
+The desktop crate's own suite covers everything in it that is not a cpal
+stream: config selection against synthetic device capabilities, the four format
+conversions, the discovery exchange over a loopback socket, the command line,
+the stream-error classification, and the text field's key handling — plus the
+UI itself. GPUI ships a test platform with a real window, layout pass and paint
+pass and no display behind any of it, so `render` runs under `cargo test` on
+both panels, on a full desk of eight strips, and on the error banner. That
+catches anything in the render path that panics or fails to lay out; it does
+not look at pixels, so a control drawn the wrong colour still needs eyes.
+
+The suite needs ALSA and the GPUI system libraries to build, so `run_tests.sh`
+skips it with a message where they are missing rather than failing.
+
+CI runs all three suites on every push, and builds the APK.
 
 What used to need ASan and TSan to check is now checked by the compiler: the
 lock-free buffers cannot be reached from the wrong thread, because the halves
@@ -205,6 +256,20 @@ Real, understood, and deliberately not fixed.
   Rust one. Attack is applied flat across the whole block so the ceiling holds,
   but the gain reduction from a transient is spread over the samples in front
   of it rather than starting exactly at the peak.
+* **The desktop app is 48 kHz only.** There is no resampler anywhere in the
+  engine, so a device that will not run at 48 kHz is listed as unusable rather
+  than rate-converted behind your back. On Linux that is rarely a real
+  restriction: PulseAudio and PipeWire both offer 48 kHz whatever the hardware
+  is doing underneath.
+* **The desktop UI's text fields are the small half of a text input.**
+  Printable characters, backspace, Ctrl-U and Enter. No selection, no
+  clipboard, no IME - three short fields did not justify the seven hundred
+  lines GPUI's own example spends on a real one.
+* **Starting a desktop session blocks the UI thread** for as long as the
+  backend takes to open a stream. That is milliseconds on a working device and
+  up to the two-second open timeout on a wedged one.
+* **The desktop UI's appearance is not tested.** The render tests prove the
+  tree lays out; nothing checks that it looks right.
 * **Clock drift is shed, not tracked.** The trim drops the oldest audio every
   few minutes instead of resampling to the receiver's clock.
 * **The C++ runtime is linked statically.** `oboe-sys` pulls in

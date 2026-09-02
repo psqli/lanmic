@@ -10,6 +10,7 @@
 //!   mod.rs        the view, its state, and everything that starts or stops
 //!   mixer.rs      the mixer panel: channel strips, master, feedback
 //!   mic.rs        the microphone panel: server, device, level
+//!   frame.rs      the window frame, where the platform does not draw one
 //!   widgets.rs    meter, slider, button, one-line text field
 //!   theme.rs      colours
 //! ```
@@ -18,6 +19,7 @@
 //! it re-reads the counters, and GPUI diffs the result. Nothing here blocks on
 //! audio, and nothing on an audio thread knows this file exists.
 
+mod frame;
 mod mic;
 mod mixer;
 mod theme;
@@ -26,8 +28,9 @@ mod widgets;
 use std::time::Duration;
 
 use gpui::{
-    div, prelude::*, px, rgb, size, App, Application, Bounds, Context, FocusHandle, KeyDownEvent,
-    SharedString, Task, TitlebarOptions, Window, WindowBounds, WindowOptions,
+    div, prelude::*, px, rgb, size, App, Application, Bounds, Context, Decorations, FocusHandle,
+    KeyDownEvent, SharedString, Task, TitlebarOptions, Window, WindowBounds, WindowDecorations,
+    WindowOptions,
 };
 
 use lanmic::mixer::{SourceSnapshot, DEFAULT_FEEDBACK_SHIFT_HZ, MAX_FEEDBACK_SHIFT_HZ};
@@ -513,41 +516,46 @@ impl LanMic {
         ))
     }
 
-    fn header(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+    /// The top row, which is also the titlebar. The name and the strapline are
+    /// one drag region that stretches to meet the tabs, so there is a generous
+    /// area to move the window by that never overlaps a control.
+    fn header(
+        &mut self,
+        decorations: Decorations,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         let live = self.is_live();
         div()
             .flex()
             .flex_row()
             .items_center()
-            .justify_between()
-            .child(
+            .gap_2()
+            .child(frame::draggable(
                 div()
+                    .id("titlebar-drag")
                     .flex()
                     .flex_row()
+                    .flex_1()
                     .items_baseline()
                     .gap_2()
                     .child(div().text_lg().text_color(rgb(TEXT)).child("LAN Mic"))
                     .child(label("48 kHz mono, no codec")),
-            )
+                decorations,
+            ))
+            .child(self.tab(Panel::Mixer, "Mixer", cx))
+            .child(self.tab(Panel::Microphone, "Microphone", cx))
             .child(
                 div()
-                    .flex()
-                    .flex_row()
-                    .gap_2()
-                    .items_center()
-                    .child(self.tab(Panel::Mixer, "Mixer", cx))
-                    .child(self.tab(Panel::Microphone, "Microphone", cx))
-                    .child(
-                        div()
-                            .px_2()
-                            .py_1()
-                            .rounded_md()
-                            .text_xs()
-                            .bg(rgb(if live { LIVE } else { PANEL_ALT }))
-                            .text_color(rgb(if live { 0x0d1f14 } else { MUTED }))
-                            .child(if live { "LIVE" } else { "idle" }),
-                    ),
+                    .px_2()
+                    .py_1()
+                    .rounded_md()
+                    .text_xs()
+                    .bg(rgb(if live { LIVE } else { PANEL_ALT }))
+                    .text_color(rgb(if live { 0x0d1f14 } else { MUTED }))
+                    .child(if live { "LIVE" } else { "idle" }),
             )
+            .children(frame::controls(decorations, window))
     }
 
     fn error_bar(&self) -> Option<impl IntoElement> {
@@ -567,32 +575,37 @@ impl LanMic {
 }
 
 impl Render for LanMic {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // Everything drawn below comes from state the refresh tick collected in
         // `poll`, so one frame cannot disagree with itself about who is on the
         // desk - and so a test can put strips on the screen without a device.
-        let header = self.header(cx);
+        let decorations = window.window_decorations();
+        let header = self.header(decorations, window, cx);
         let panel = match self.panel {
             Panel::Mixer => self.render_mixer(cx).into_any_element(),
             Panel::Microphone => self.render_mic(cx).into_any_element(),
         };
 
-        div()
-            .id("root")
-            .track_focus(&self.focus)
-            .on_key_down(cx.listener(|this, event, _, cx| this.on_key(event, cx)))
-            .size_full()
-            .flex()
-            .flex_col()
-            .gap_3()
-            .p_4()
-            .bg(rgb(BG))
-            .text_color(rgb(TEXT))
-            .font_family("sans-serif")
-            .text_sm()
-            .child(header)
-            .children(self.error_bar())
-            .child(panel)
+        // The shell is the window's own border and resize grip, and draws
+        // nothing at all where the platform provides them.
+        frame::shell(decorations).child(
+            div()
+                .id("root")
+                .track_focus(&self.focus)
+                .on_key_down(cx.listener(|this, event, _, cx| this.on_key(event, cx)))
+                .size_full()
+                .flex()
+                .flex_col()
+                .gap_3()
+                .p_4()
+                .bg(rgb(BG))
+                .text_color(rgb(TEXT))
+                .font_family("sans-serif")
+                .text_sm()
+                .child(header)
+                .children(self.error_bar())
+                .child(panel),
+        )
     }
 }
 
@@ -620,6 +633,14 @@ pub fn run(options: Options) {
                 }),
                 window_min_size: Some(size(px(880.), px(560.))),
                 app_id: Some("com.lanmic.audio".into()),
+                // Linux only, and ignored elsewhere. Asking for client-side
+                // decorations is what makes GNOME's Wayland session - which
+                // does not implement the server-side protocol at all - report
+                // `Decorations::Client` so `frame` knows to draw a titlebar
+                // instead of leaving a window with no way to move or close it.
+                // X11 without a compositor refuses and falls back to the
+                // window manager's own, which is the right answer there.
+                window_decorations: Some(WindowDecorations::Client),
                 ..Default::default()
             },
             |window, cx| cx.new(|cx| LanMic::new(options, window, cx)),

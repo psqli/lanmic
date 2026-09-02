@@ -22,6 +22,9 @@ lanmic = { path = "../rust" }
 gpui = "0.2"
 # What Oboe is on the phone: one API over ALSA, CoreAudio and WASAPI.
 cpal = "0.18"
+# The command line. Derive, because the flags are a struct and writing them
+# twice - once as a parser, once as help text - is how the two drift apart.
+clap = { version = "4.6", features = ["derive"] }
 # Only to answer "which address do I tell the phones?".
 if-addrs = "0.14"
 log = "0.4"

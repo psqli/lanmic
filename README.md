@@ -123,7 +123,7 @@ cargo run --release -- --headless --mic 192.168.1.50 --input "Scarlett"
 Flags mirror the Python server's where they overlap: `--port`, `--jitter`,
 `--blocksize`, `--name`, `--discovery-port`, `--no-discovery`, plus `--output`
 and `--input` (a substring of the device name is enough), `--mic HOST` and
-`--packet`.
+`--packet`. `lanmic --help` lists them all.
 
 On Linux the build needs ALSA and the GPUI system libraries:
 

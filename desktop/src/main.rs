@@ -8,6 +8,7 @@
 //! Compose.
 //!
 //! ```text
+//!   src/args.rs       the command line
 //!   src/audio.rs      cpal: devices, 48 kHz configs, format conversion
 //!   src/engine.rs     the two sessions and the threads around them
 //!   src/discovery.rs  DISCOVER / ANNOUNCE, both halves
@@ -30,19 +31,14 @@ fn main() -> ExitCode {
     // Quiet by default; `RUST_LOG=lanmic_desktop=debug` when something is wrong.
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).init();
 
-    let options = match args::parse(std::env::args().skip(1)) {
+    // clap prints its own help, version and errors, on the right stream and
+    // with the right exit code, and `exit` does not come back.
+    let options = match args::parse_from(std::env::args()) {
         Ok(options) => options,
-        Err(message) => {
-            eprintln!("lanmic: {message}\n\n{}", args::USAGE);
-            return ExitCode::FAILURE;
-        }
+        Err(e) => e.exit(),
     };
 
     let result = match options.mode {
-        Mode::Help => {
-            print!("{}", args::USAGE);
-            return ExitCode::SUCCESS;
-        }
         Mode::ListDevices => {
             console::list_devices();
             return ExitCode::SUCCESS;

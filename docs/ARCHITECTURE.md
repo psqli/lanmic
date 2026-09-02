@@ -82,14 +82,14 @@ supplies and no more: audio streams, and a UI.
 | File | What it is |
 |---|---|
 | `main.rs` | Mode selection: window, `--headless` mixer, `--headless --mic`, `--list-devices`. |
-| `args.rs` | The command line, parsed by hand. Flags match `lan_audio_server.py` where they overlap. |
+| `args.rs` | The command line: a `clap` derive struct, and the mapping from it onto the two config structs. Flags match `lan_audio_server.py` where they overlap. |
 | `audio.rs` | cpal: device enumeration, 48 kHz config selection, and the four format conversions between cpal buffers and what the engine takes. |
 | `engine.rs` | `Server` and `Microphone`: `android.rs` with cpal streams. Same supervisor, same threads, same `*Shared` atomics. |
 | `discovery.rs` | DISCOVER/ANNOUNCE, both halves, encoded with `lanmic::protocol`. |
 | `console.rs` | The `--headless` status line, for a machine in a rack. |
 | `ui/` | The GPUI window: `mod.rs` the view and its state, `mixer.rs` and `mic.rs` the two panels, `widgets.rs` meter/slider/field, `theme.rs` colours. |
 
-Extra dependencies over the engine's: `gpui`, `cpal`, `if-addrs`, `env_logger`.
+Extra dependencies over the engine's: `gpui`, `cpal`, `clap`, `if-addrs`, `env_logger`.
 
 **The engine is not modified for the desktop.** The desktop's whole job is to
 push `i16` into `CaptureEncoder::push` and pull `f32` out of `Mixer::render`;

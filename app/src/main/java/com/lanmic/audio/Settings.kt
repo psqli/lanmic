@@ -40,6 +40,21 @@ class Settings private constructor(private val p: SharedPreferences) {
         get() = p.getInt("preset", 0)
         set(v) = p.edit().putInt("preset", v).apply()
 
+    /**
+     * Which microphone to capture from, as an [AudioDevices] key rather than an
+     * `AudioDeviceInfo` id: ids are handed out when a device appears, so the
+     * one written here on Friday means nothing on Saturday. Empty is
+     * [AudioDevices.AUTOMATIC] - let Android route it.
+     */
+    var inputDevice: String
+        get() = p.getString("inputDevice", AudioDevices.AUTOMATIC).orEmpty()
+        set(v) = p.edit().putString("inputDevice", v).apply()
+
+    /** Which output the mix plays out of. Same shape as [inputDevice]. */
+    var outputDevice: String
+        get() = p.getString("outputDevice", AudioDevices.AUTOMATIC).orEmpty()
+        set(v) = p.edit().putString("outputDevice", v).apply()
+
     var txGain: Float
         get() = p.getFloat("txGain", 1f)
         set(v) = p.edit().putFloat("txGain", v).apply()

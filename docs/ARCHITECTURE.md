@@ -65,7 +65,8 @@ streams, `jni`, and `log`/`android_logger`.
 |---|---|
 | `MainActivity.kt` | Compose entry point, mode toggle, permission prompt. |
 | `MicScreen.kt` / `ServerScreen.kt` | The two screens; each polls native counters every `UI_POLL_MS`. |
-| `Components.kt` | `LevelMeter` (dBFS scale) and `StatRow`. |
+| `AudioDevices.kt` | Which microphone to capture from and which output to play out of: the allow-listed device types, the stable key that is remembered in place of an id, and the lookup back to an id at stream-open time. |
+| `Components.kt` | `LevelMeter` (dBFS scale), `StatRow`, and the inline `DevicePicker`. |
 | `Theme.kt` | `Palette`, the colour scheme and the `Panel` card. |
 | `Settings.kt` | Typed wrapper over the one `SharedPreferences` file. |
 | `NativeAudio.kt` | JNI facade plus the `TxStats` / `RxStats` / `SourceInfo` data classes. |
@@ -87,6 +88,7 @@ supplies and no more: audio streams, and a UI.
 | `engine.rs` | `Server` and `Microphone`: `android.rs` with cpal streams. Same supervisor, same threads, same `*Shared` atomics. |
 | `discovery.rs` | DISCOVER/ANNOUNCE, both halves, encoded with `lanmic::protocol`. |
 | `console.rs` | The `--headless` status line, for a machine in a rack. |
+| `virtualmic.rs` | The mix offered to the rest of the machine as a microphone: the audio-thread tap, and the PulseAudio/PipeWire pipe source it feeds. |
 | `ui/` | The GPUI window: `mod.rs` the view and its state, `mixer.rs` and `mic.rs` the two panels, `widgets.rs` the peak meter and the readouts, `theme.rs` colours. |
 
 Extra dependencies over the engine's: `gpui`, `gpui-component`, `cpal`, `clap`,
@@ -116,6 +118,7 @@ Six threads matter. Nothing else may touch the marked structures.
 | Network (mixer) | `PacketRouter`: every jitter buffer's write half, slot lifecycle | Blocking on the audio thread |
 | Stream supervisor | The Oboe stream itself, and nothing else does | Touching audio data |
 | Discovery | Its own socket | Anything on the audio path |
+| Virtual microphone writer (desktop) | The tap ring's read half, the FIFO | Blocking: the FIFO is `O_NONBLOCK` and a full one drops rather than waits |
 | Service worker (Android) | `AudioService` locks, responder, engine start/stop | Nothing - but it is the *only* thread allowed to do them |
 | UI (Compose / GPUI) | Reads counters through relaxed atomics | Blocking (stat calls use `try_lock`) |
 
@@ -225,7 +228,73 @@ There is a layout test for the effect rather than the mechanism: a channel
 strip is rendered with a two-character buffer reading and again with three,
 and the last reading in the row has to land on the same pixel both times.
 
-### Why the audio-thread state sits behind a `Mutex`
+### Why the virtual microphone is a pipe source
+
+A mixer plugged into a PA plays out of a speaker. A mixer on the laptop that is
+also in the video call wants the same mix somewhere a *different* program can
+open it, and no operating system lets one process hand another its output as a
+capture device.
+
+On PulseAudio and PipeWire one module comes close. `module-pipe-source` creates
+a real source - a microphone, as far as every other program is concerned - that
+reads raw PCM out of a FIFO. So the mixer loads one, and writes the mix into it:
+
+```
+Mixer::render ─▶ output callback ─▶ TapSink (SPSC ring) ─▶ writer thread ─▶ FIFO ─▶ module-pipe-source
+```
+
+Three things follow from that shape.
+
+**The tap is downstream of everything.** Master gain, the feedback shifter and
+the limiter have all run, so a call hears what the room hears - including the
+shift, which is right for a room being reinforced and wrong for a call. It is
+one setting away either way.
+
+**The mixer's own output stream is the clock.** The tap is filled by the output
+callback, so the source advances at the rate the speakers do, from one clock,
+with no second device to drift against. It also means a mixer whose output
+stream is down feeds the source nothing, and PulseAudio pads the gap with
+silence.
+
+**Switching it on never touches the stream.** The tap is a `Mutex<Option<..>>`
+beside the mixer, not part of it, and the callback only ever `try_lock`s it. So
+the UI thread can install or remove a tap under a running stream: the worst it
+can cost is one block the virtual microphone does not get, and the room hears
+nothing. That is what lets the control be live rather than a next-start
+setting - which matters, because what it is for is the moment somebody joins a
+call.
+
+Everything that can block is on the writer thread: the FIFO is opened
+`O_NONBLOCK`, a backlog past 200 ms is dropped from its oldest end rather than
+allowed to become latency, and both the ring and the pipe count what they lose
+so the window can say so.
+
+Windows and macOS have no equivalent - a virtual microphone there is a driver
+somebody else installs - so the feature says so and points at the thing that
+does work: a loopback device (VB-Cable, BlackHole) picked from the output list
+like any other device.
+
+### Why a remembered Android device is a key, not an id
+
+Oboe routes a stream to an `AudioDeviceInfo.getId()`, and those ids are handed
+out when a device appears. Unplug a USB interface and plug it back in and it
+has a new one; reboot and everything does. An id written to preferences on
+Friday means nothing on Saturday, and the one it now names may well be the
+earpiece.
+
+So `AudioDevices` remembers a key built from the device's type and product
+name, which does survive both, and resolves it back to an id on the worker
+thread immediately before the stream is opened - the last moment at which it
+can still be right. A key that resolves to nothing is not an error: it falls
+back to letting Android route the stream, because a microphone that starts on
+the built-in capsule is a better outcome than one that refuses to start
+because the interface was left in the other bag. The screen says which of the
+two happened.
+
+The menu is built from an allow-list of device types rather than a deny-list.
+Bluetooth is the reason: SCO and A2DP both cost more delay than this whole
+app's latency budget, so offering them would be offering a way to make it not
+work.
 
 ### Why the audio-thread state sits behind a `Mutex`
 
@@ -345,6 +414,16 @@ Real, understood, and deliberately not fixed.
   trade.
 * **Clock drift is shed, not tracked.** The trim drops the oldest audio every
   few minutes instead of resampling to the receiver's clock.
+* **The virtual microphone needs PulseAudio or PipeWire.** It is
+  `module-pipe-source` and `pactl`, so it works on essentially every Linux
+  desktop and nowhere else. macOS and Windows get an error that names the
+  alternative rather than a control that does nothing.
+* **The virtual microphone carries the shifted, limited mix**, because it is
+  fed from the same point the speakers are. Turn the feedback shifter off when
+  the mix is going down a wire rather than into a room.
+* **A source left behind by a killed session is swept, not prevented.** The
+  next start unloads any `module-pipe-source` still holding the name; a session
+  that is killed rather than stopped leaves one loaded until then.
 * **The C++ runtime is linked statically.** `oboe-sys` pulls in
   `libc++_static.a`, which leaves the ABI runtime to `libc++abi.a` - linked
   explicitly in `build.rs`, because a shared object may carry undefined symbols

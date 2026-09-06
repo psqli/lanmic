@@ -26,6 +26,11 @@ gpui = "0.2"
 gpui-component = "0.5"
 # What Oboe is on the phone: one API over ALSA, CoreAudio and WASAPI.
 cpal = "0.18"
+# The same wait-free SPSC ring the engine's jitter buffers are built on, here
+# carrying the mix from the output callback to the virtual microphone's writer
+# thread. Same crate, same version, for the same reason: the audio thread must
+# never allocate and never block.
+rtrb = "0.4"
 # The command line. Derive, because the flags are a struct and writing them
 # twice - once as a parser, once as help text - is how the two drift apart.
 clap = { version = "4.6", features = ["derive"] }

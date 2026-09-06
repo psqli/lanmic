@@ -25,6 +25,7 @@ use lanmic::util;
 
 use crate::audio::{self, Chosen, Direction};
 use crate::discovery;
+use crate::virtualmic::{self, Tap, VirtualMic};
 
 /// How long the sender thread sleeps if the audio callback never wakes it.
 /// Same value, same reason, as on the phone.
@@ -129,6 +130,11 @@ pub struct ServerConfig {
     pub device: Option<String>,
     pub block_frames: u32,
     pub discovery: bool,
+    /// Offer the mix to the rest of this machine as a microphone as well as
+    /// playing it out of `device`. See [`crate::virtualmic`].
+    pub virtual_mic: bool,
+    /// What other programs will see that microphone called.
+    pub virtual_mic_name: String,
 }
 
 impl Default for ServerConfig {
@@ -141,6 +147,8 @@ impl Default for ServerConfig {
             device: None,
             block_frames: DEFAULT_BLOCK_FRAMES,
             discovery: true,
+            virtual_mic: false,
+            virtual_mic_name: virtualmic::DEFAULT_NAME.to_string(),
         }
     }
 }
@@ -181,6 +189,14 @@ pub struct Server {
     discovery_running: Arc<AtomicBool>,
     device_name: String,
     output_channels: usize,
+    /// Where the output callback looks for the virtual microphone's ring. It
+    /// is created empty and outlives every stream, so attaching a microphone
+    /// is a lock on this rather than a new stream.
+    tap: Arc<Tap>,
+    /// `Some` while a virtual microphone is loaded. Dropping it unloads the
+    /// PulseAudio source, so this is also what stops one.
+    virtual_mic: Option<VirtualMic>,
+    virtual_mic_name: String,
 }
 
 impl Server {
@@ -202,6 +218,7 @@ impl Server {
         // Threads join the session as they are spawned, so an early return from
         // here drops it and stops the ones already running rather than leaving
         // them holding the port.
+        let tap: Arc<Tap> = Arc::new(Mutex::new(None));
         let mut engine = Server {
             shared: shared.clone(),
             table,
@@ -209,6 +226,9 @@ impl Server {
             discovery_running: Arc::new(AtomicBool::new(true)),
             device_name,
             output_channels,
+            tap: tap.clone(),
+            virtual_mic: None,
+            virtual_mic_name: config.virtual_mic_name.clone(),
         };
 
         engine
@@ -254,7 +274,7 @@ impl Server {
                                 audio::open_device(Direction::Output, device_choice.as_deref())?;
                             let chosen =
                                 audio::config_for(&device, Direction::Output, block_frames)?;
-                            open_output(&device, &chosen, &mixer, &shared, &xruns)
+                            open_output(&device, &chosen, &mixer, &shared, &xruns, &tap)
                         },
                         {
                             let shared = shared.clone();
@@ -301,6 +321,30 @@ impl Server {
         self.output_channels
     }
 
+    /// Turns the virtual microphone on or off under a running mixer.
+    ///
+    /// Live rather than a next-start setting, and deliberately so: the whole
+    /// point of it is the moment somebody joins a call and wants the mix in it.
+    /// Neither direction touches the output stream - the tap is a slot beside
+    /// it, and the callback only ever `try_lock`s that - so switching it costs
+    /// the speakers nothing.
+    pub fn set_virtual_mic(&mut self, on: bool) -> io::Result<()> {
+        if on == self.virtual_mic.is_some() {
+            return Ok(());
+        }
+        if on {
+            self.virtual_mic = Some(VirtualMic::start(&self.virtual_mic_name, &self.tap)?);
+        } else {
+            self.virtual_mic = None;
+        }
+        Ok(())
+    }
+
+    /// The virtual microphone, if one is loaded: its name and its counters.
+    pub fn virtual_mic(&self) -> Option<&VirtualMic> {
+        self.virtual_mic.as_ref()
+    }
+
     pub fn is_running(&self) -> bool {
         self.shared.running.load(Ordering::Acquire)
     }
@@ -308,6 +352,9 @@ impl Server {
 
 impl Drop for Server {
     fn drop(&mut self) {
+        // First: it unloads a PulseAudio source, which should not outlive the
+        // mix that was feeding it even by the length of a thread join.
+        self.virtual_mic = None;
         self.shared.running.store(false, Ordering::Release);
         self.discovery_running.store(false, Ordering::Release);
         for t in self.threads.drain(..) {
@@ -323,6 +370,7 @@ fn open_output(
     mixer: &Arc<Mutex<Mixer>>,
     shared: &Arc<RxShared>,
     xruns: &Arc<Counter>,
+    tap: &Arc<Tap>,
 ) -> io::Result<cpal::Stream> {
     let channels = chosen.channels();
     let errors = {
@@ -341,6 +389,7 @@ fn open_output(
         ($sample:ty, $write:path) => {{
             let mixer = mixer.clone();
             let shared = shared.clone();
+            let tap = tap.clone();
             device.build_output_stream(
                 chosen.config,
                 move |out: &mut [$sample], info: &cpal::OutputCallbackInfo| {
@@ -350,6 +399,16 @@ fn open_output(
                             let frames = out.len() / channels.max(1);
                             let mix = mixer.render(frames);
                             $write(mix, out, channels);
+                            // The virtual microphone gets what the speakers
+                            // get. `try_lock` because the UI thread may be
+                            // installing or removing the tap; missing a block
+                            // costs the microphone 5 ms and the room nothing,
+                            // which is the right way round.
+                            if let Ok(mut tap) = tap.try_lock() {
+                                if let Some(sink) = tap.as_mut() {
+                                    sink.push(mix);
+                                }
+                            }
                         }
                         Err(_) => out.fill(Default::default()),
                     }

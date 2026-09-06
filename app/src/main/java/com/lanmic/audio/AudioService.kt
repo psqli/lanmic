@@ -37,12 +37,24 @@ class AudioService : Service() {
         const val EXTRA_JITTER_MS = "jitterMs"
         const val EXTRA_SERVER_NAME = "serverName"
 
+        /**
+         * An [AudioDevices] key, not a device id. The id is looked up here,
+         * on the worker thread, immediately before the stream is opened -
+         * which is the last moment at which it can still be right.
+         */
+        const val EXTRA_DEVICE = "device"
+
         private const val CHANNEL_ID = "lanmic"
         private const val NOTIF_ID = 42
         private const val TAG = "lanmic-svc"
 
         fun startTransmitter(
-            ctx: Context, host: String, port: Int, packetFrames: Int, inputPreset: Int
+            ctx: Context,
+            host: String,
+            port: Int,
+            packetFrames: Int,
+            inputPreset: Int,
+            device: String
         ) {
             val i = Intent(ctx, AudioService::class.java).apply {
                 action = ACTION_START_TX
@@ -50,16 +62,18 @@ class AudioService : Service() {
                 putExtra(EXTRA_PORT, port)
                 putExtra(EXTRA_PACKET_FRAMES, packetFrames)
                 putExtra(EXTRA_INPUT_PRESET, inputPreset)
+                putExtra(EXTRA_DEVICE, device)
             }
             ctx.startForegroundService(i)
         }
 
-        fun startServer(ctx: Context, port: Int, jitterMs: Int, name: String) {
+        fun startServer(ctx: Context, port: Int, jitterMs: Int, name: String, device: String) {
             val i = Intent(ctx, AudioService::class.java).apply {
                 action = ACTION_START_SERVER
                 putExtra(EXTRA_PORT, port)
                 putExtra(EXTRA_JITTER_MS, jitterMs)
                 putExtra(EXTRA_SERVER_NAME, name)
+                putExtra(EXTRA_DEVICE, device)
             }
             ctx.startForegroundService(i)
         }
@@ -101,18 +115,20 @@ class AudioService : Service() {
                 val port = intent.getIntExtra(EXTRA_PORT, NativeAudio.DEFAULT_PORT)
                 val frames = intent.getIntExtra(EXTRA_PACKET_FRAMES, 240)
                 val preset = intent.getIntExtra(EXTRA_INPUT_PRESET, 0)
+                val device = intent.getStringExtra(EXTRA_DEVICE).orEmpty()
                 goForeground("Transmitting to $host:$port", microphone = true)
                 val gen = generation.incrementAndGet()
-                worker.execute { startTx(gen, host, port, frames, preset) }
+                worker.execute { startTx(gen, host, port, frames, preset, device) }
             }
 
             ACTION_START_SERVER -> {
                 val port = intent.getIntExtra(EXTRA_PORT, NativeAudio.DEFAULT_PORT)
                 val jitter = intent.getIntExtra(EXTRA_JITTER_MS, 15)
                 val name = intent.getStringExtra(EXTRA_SERVER_NAME) ?: Build.MODEL
+                val device = intent.getStringExtra(EXTRA_DEVICE).orEmpty()
                 goForeground("Mixing on udp/$port", microphone = false)
                 val gen = generation.incrementAndGet()
-                worker.execute { startServer(gen, port, jitter, name) }
+                worker.execute { startServer(gen, port, jitter, name, device) }
             }
 
             ACTION_STOP -> stopEverything()
@@ -142,10 +158,18 @@ class AudioService : Service() {
 
     // ---- worker thread only ----
 
-    private fun startTx(gen: Int, host: String, port: Int, frames: Int, preset: Int) {
+    private fun startTx(
+        gen: Int,
+        host: String,
+        port: Int,
+        frames: Int,
+        preset: Int,
+        device: String
+    ) {
         if (gen != generation.get()) return
         acquireLocks()
-        if (NativeAudio.startTransmitter(host, port, frames, preset)) {
+        val deviceId = AudioDevices.resolve(this, device, input = true)
+        if (NativeAudio.startTransmitter(host, port, frames, preset, deviceId)) {
             // A stop that arrived while the stream was opening has to win, or
             // the microphone stays live under a notification that is gone.
             if (gen != generation.get()) stopEngines()
@@ -155,10 +179,11 @@ class AudioService : Service() {
         stopEverything()
     }
 
-    private fun startServer(gen: Int, port: Int, jitter: Int, name: String) {
+    private fun startServer(gen: Int, port: Int, jitter: Int, name: String, device: String) {
         if (gen != generation.get()) return
         acquireLocks()
-        if (!NativeAudio.startServer(port, jitter)) {
+        val deviceId = AudioDevices.resolve(this, device, input = false)
+        if (!NativeAudio.startServer(port, jitter, deviceId)) {
             Log.e(TAG, "server failed to start")
             stopEverything()
             return

@@ -133,8 +133,8 @@ cargo run --release -- --headless --mic 192.168.1.50 --input "Scarlett"
 
 Flags mirror the Python server's where they overlap: `--port`, `--jitter`,
 `--blocksize`, `--name`, `--discovery-port`, `--no-discovery`, plus `--output`
-and `--input` (a substring of the device name is enough), `--mic HOST` and
-`--packet`. `lanmic --help` lists them all.
+and `--input` (a substring of the device name is enough), `--virtual-mic`,
+`--mic HOST` and `--packet`. `lanmic --help` lists them all.
 
 On Linux the build needs ALSA and the GPUI system libraries:
 
@@ -146,6 +146,29 @@ sudo apt install libasound2-dev libxkbcommon-dev libxkbcommon-x11-dev \
 Everything runs at 48 kHz with no resampler anywhere, so a device that will not
 do 48 kHz is listed as unusable rather than quietly rate-converted. On Linux
 PulseAudio and PipeWire both offer 48 kHz whatever the hardware is doing.
+
+### The mix as a microphone
+
+Under the mixer's output list is a **virtual microphone** switch. Turn it on and
+the mix also appears as a capture device called `LAN_Mic`, so a video call, a
+recorder or OBS on the same machine can open it as an input - phones on stage,
+straight into the meeting. It takes effect immediately, so it can be switched on
+mid-session, and `--virtual-mic` turns it on from the command line:
+
+```bash
+lanmic --headless --virtual-mic                   # the mix, as LAN_Mic
+lanmic --headless --virtual-mic "Front of house"  # under a name of your own
+```
+
+This is `module-pipe-source` on PulseAudio and PipeWire, which is every ordinary
+Linux desktop and nothing else. On macOS and Windows a virtual microphone is a
+driver somebody else installs: get BlackHole or VB-Cable and select it in the
+output list instead, which does the same job.
+
+Two things worth knowing. The mix reaches it after the feedback shifter, so turn
+the shifter off when the mix is going down a wire rather than into a room. And
+it is fed by the mixer's own output callback, so it advances at the rate the
+speakers do - a mixer with no working output feeds it nothing.
 
 ## Run the Python server
 
@@ -173,10 +196,20 @@ python3 test_mic_client.py --host 192.168.1.50 --mic
 
 1. Start the mixer first (phone in **Mixer / server** mode, the desktop app, or
    the Python server). All three show the IP addresses they are listening on.
-2. On each microphone phone: **Find server**, or type the address, then **GO
-   LIVE**. Grant the microphone permission once.
+   Pick the **output** the mix should play out of - a USB interface into the
+   desk beats any built-in speaker.
+2. On each microphone phone: pick the **input** to capture from, then **Find
+   server**, or type the address, then **GO LIVE**. Grant the microphone
+   permission once.
 3. Speak. The mixer lists each microphone with a level meter, its current
    buffer depth, and its loss counters.
+
+Both device menus list what is plugged in now and follow it as things are
+plugged and unplugged. Bluetooth is deliberately absent from both: SCO and A2DP
+each cost more delay than this whole app's budget. On the phone, a choice is
+remembered by what the device is rather than by the id Android gave it, so it
+survives a replug and a reboot; if it is not there when you start, Android
+routes the stream and the screen says so.
 
 The phones keep running with the screen off — a foreground service holds a
 Wi-Fi low-latency lock and a partial wake lock. Do not swipe the app away.
@@ -257,6 +290,9 @@ step. CI runs all three on every push.
 * 8 simultaneous microphones on any mixer running the Rust engine
   (`MAX_SOURCES` in `rust/src/mixer.rs`).
 * Mono on the wire; the mixer plays the same mix to every output channel.
+* The virtual microphone is Linux-only: it is `module-pipe-source`, so it needs
+  PulseAudio or PipeWire. Elsewhere, a loopback driver selected as the output
+  does the same job.
 * No encryption and no authentication. Anyone on the LAN can send audio to the
   mixer. Use a private AP.
 * Feedback suppression is a frequency shift, not echo cancellation, and it buys

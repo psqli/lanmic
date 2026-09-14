@@ -15,6 +15,7 @@ use lanmic::mixer::{SourceSnapshot, MAX_SOURCES};
 use lanmic::receiver::{RxStats, MAX_JITTER_MS, MIN_JITTER_MS};
 
 use crate::audio::Direction;
+use crate::virtualmic::Stats;
 
 use super::theme::*;
 use super::widgets::*;
@@ -230,6 +231,99 @@ impl LanMic {
                         cx,
                     )),
             )
+            .child(self.mixer_virtual_mic(running, cx))
+    }
+
+    /// The mix offered to the rest of this machine as a microphone.
+    ///
+    /// It lives under the output list because that is what it is: a second
+    /// place the same mix goes. Unlike the jitter target it takes effect at
+    /// once, so the button says what will happen rather than what will happen
+    /// next time.
+    fn mixer_virtual_mic(&mut self, running: bool, cx: &mut Context<Self>) -> impl IntoElement {
+        let live = self
+            .server
+            .as_ref()
+            .and_then(|s| s.virtual_mic())
+            .map(|mic| {
+                let stats = mic.stats();
+                (
+                    mic.name().to_string(),
+                    stats.alive(),
+                    stats.frames_dropped(),
+                )
+            });
+        let counters = self
+            .server
+            .as_ref()
+            .and_then(|s| s.virtual_mic())
+            .map(|mic| {
+                let stats = mic.stats();
+                (
+                    Stats::seconds(stats.frames_in()),
+                    Stats::seconds(stats.frames_out()),
+                    stats.frames_dropped(),
+                )
+            });
+        let on = live.is_some();
+
+        v_flex()
+            .gap_1()
+            .pt_1()
+            .child(
+                h_flex()
+                    .items_center()
+                    .justify_between()
+                    .child(label("virtual microphone"))
+                    .child(
+                        Button::new("virtual-mic")
+                            .label(if on { "ON" } else { "off" })
+                            .outline()
+                            .xsmall()
+                            .selected(on)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.toggle_virtual_mic();
+                                cx.notify();
+                            })),
+                    ),
+            )
+            .when_some(live, |this, (name, alive, dropped)| {
+                this.child(
+                    div()
+                        .text_xs()
+                        .text_color(rgb(if alive { LIVE } else { WARN }))
+                        .child(if alive {
+                            format!("'{name}' - open it as an input in any other program")
+                        } else {
+                            format!("'{name}' stopped: the source went away")
+                        }),
+                )
+                .when(dropped > 0, |this| {
+                    this.child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(WARN))
+                            .child(format!("{dropped} frames never reached it")),
+                    )
+                })
+            })
+            .when_some(counters, |this, (fed, carried, dropped)| {
+                // "in" and "out" drifting apart is the pipe backing up, which
+                // is the one failure here that is not obvious from the audio.
+                this.child(
+                    readings()
+                        .child(stat("in", format!("{fed:.0} s"), W_MS))
+                        .child(stat("out", format!("{carried:.0} s"), W_MS))
+                        .child(stat("drop", dropped.to_string(), W_COUNT)),
+                )
+            })
+            .when(!on, |this| {
+                this.child(label(if running {
+                    "Puts the mix on a source a video call or a recorder here can open."
+                } else {
+                    "Start the mixer first; the microphone carries its mix."
+                }))
+            })
     }
 
     fn mixer_addresses(&self) -> impl IntoElement {

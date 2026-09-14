@@ -16,6 +16,7 @@ use lanmic::protocol::{DEFAULT_AUDIO_PORT, DISCOVERY_PORT};
 use lanmic::receiver::{MAX_JITTER_MS, MIN_JITTER_MS};
 
 use crate::engine::{default_server_name, MicConfig, ServerConfig, DEFAULT_BLOCK_FRAMES};
+use crate::virtualmic;
 
 /// Ranges are declared here rather than checked afterwards, so a bad value is
 /// refused by the parser with the range in the message - and so the help text
@@ -31,6 +32,7 @@ Examples:
   lanmic --headless               run the mixer on this terminal
   lanmic --headless --mic HOST    run this machine as a microphone
   lanmic --list-devices           show the audio devices and exit
+  lanmic --headless --virtual-mic the mixer, with the mix as a local microphone
 
 Device names are matched by substring, so --output usb is enough. Everything
 runs at 48 kHz with no resampler, so a device that will not do 48 kHz is
@@ -81,6 +83,16 @@ pub struct Cli {
     /// Do not answer discovery probes
     #[arg(long, help_heading = "Mixer")]
     pub no_discovery: bool,
+
+    /// Also offer the mix to this machine as a microphone [name: LAN_Mic]
+    ///
+    /// Creates a PulseAudio/PipeWire source carrying the mix, so a video call
+    /// or a recorder on this machine can open it as an input. Spaces in the
+    /// name become underscores.
+    #[arg(long, value_name = "NAME", num_args = 0..=1,
+          default_missing_value = virtualmic::DEFAULT_NAME,
+          help_heading = "Mixer")]
+    pub virtual_mic: Option<String>,
 
     // -- microphone -------------------------------------------------------
     /// Server address: the mixer's IP
@@ -157,6 +169,15 @@ impl From<Cli> for Options {
                 device: cli.output,
                 block_frames: cli.blocksize,
                 discovery: !cli.no_discovery,
+                virtual_mic: cli.virtual_mic.is_some(),
+                // An empty `--virtual-mic ""` would name a source nothing;
+                // `sanitise_name` is what decides that, so it decides it here
+                // too rather than this having its own opinion.
+                virtual_mic_name: virtualmic::sanitise_name(
+                    cli.virtual_mic
+                        .as_deref()
+                        .unwrap_or(virtualmic::DEFAULT_NAME),
+                ),
             },
             mic: MicConfig {
                 host,
@@ -213,6 +234,28 @@ mod tests {
         assert!(o.server.device.is_none());
         assert!(o.mic.device.is_none());
         assert!(!o.server.name.trim().is_empty());
+        assert!(!o.server.virtual_mic);
+    }
+
+    #[test]
+    fn the_virtual_microphone_is_off_until_asked_for_and_can_be_named() {
+        assert!(!parse_str("").unwrap().server.virtual_mic);
+
+        let o = parse_str("--virtual-mic").unwrap();
+        assert!(o.server.virtual_mic);
+        assert_eq!(o.server.virtual_mic_name, virtualmic::DEFAULT_NAME);
+
+        // The name goes through the same sanitiser the window uses, so what the
+        // flag promises and what the source is called cannot drift apart.
+        let o = parse_from(["lanmic", "--virtual-mic", "Front of house"]).unwrap();
+        assert!(o.server.virtual_mic);
+        assert_eq!(o.server.virtual_mic_name, "Front_of_house");
+
+        // A bare --virtual-mic must not swallow the flag after it.
+        let o = parse_str("--virtual-mic --no-discovery").unwrap();
+        assert!(o.server.virtual_mic);
+        assert!(!o.server.discovery);
+        assert_eq!(o.server.virtual_mic_name, virtualmic::DEFAULT_NAME);
     }
 
     #[test]

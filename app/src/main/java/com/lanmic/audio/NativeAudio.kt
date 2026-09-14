@@ -28,7 +28,8 @@ object NativeAudio {
         host: String,
         port: Int,
         framesPerPacket: Int,
-        inputPreset: Int
+        inputPreset: Int,
+        deviceId: Int
     ): Boolean
 
     private external fun nativeStopTransmitter()
@@ -37,8 +38,17 @@ object NativeAudio {
     private external fun nativeSetTxMuted(muted: Boolean)
     private external fun nativeTxStats(): DoubleArray?
 
-    fun startTransmitter(host: String, port: Int, packetFrames: Int, inputPreset: Int) =
-        nativeStartTransmitter(host, port, packetFrames, inputPreset)
+    /**
+     * `deviceId` is an `AudioDeviceInfo.getId()`, or [AudioDevices.UNSPECIFIED]
+     * to let Android route the capture itself. See [AudioDevices].
+     */
+    fun startTransmitter(
+        host: String,
+        port: Int,
+        packetFrames: Int,
+        inputPreset: Int,
+        deviceId: Int = AudioDevices.UNSPECIFIED
+    ) = nativeStartTransmitter(host, port, packetFrames, inputPreset, deviceId)
 
     fun stopTransmitter() = nativeStopTransmitter()
     fun isTransmitting() = nativeIsTransmitting()
@@ -61,7 +71,7 @@ object NativeAudio {
 
     // ---- server ----
 
-    private external fun nativeStartServer(port: Int, jitterMs: Int): Boolean
+    private external fun nativeStartServer(port: Int, jitterMs: Int, deviceId: Int): Boolean
     private external fun nativeStopServer()
     private external fun nativeIsServing(): Boolean
     private external fun nativeSetMasterGain(gain: Float)
@@ -71,7 +81,9 @@ object NativeAudio {
     private external fun nativeServerStats(): DoubleArray?
     private external fun nativeServerSources(): DoubleArray?
 
-    fun startServer(port: Int, jitterMs: Int) = nativeStartServer(port, jitterMs)
+    /** `deviceId` as in [startTransmitter], for the output this time. */
+    fun startServer(port: Int, jitterMs: Int, deviceId: Int = AudioDevices.UNSPECIFIED) =
+        nativeStartServer(port, jitterMs, deviceId)
     fun stopServer() = nativeStopServer()
     fun isServing() = nativeIsServing()
     fun setMasterGain(gain: Float) = nativeSetMasterGain(gain)

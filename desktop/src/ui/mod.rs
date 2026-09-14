@@ -398,10 +398,21 @@ impl LanMic {
             config.name = name;
         }
 
+        let wants_virtual_mic = config.virtual_mic;
         match Server::start(&config) {
             Ok(server) => {
                 self.options.server = config;
                 self.server = Some(server);
+                // `--virtual-mic`, or a session that had one before it was
+                // stopped: a new mixer starts without one, so the intent has to
+                // be reapplied rather than assumed to have survived.
+                if wants_virtual_mic {
+                    if let Some(server) = self.server.as_mut() {
+                        if let Err(e) = server.set_virtual_mic(true) {
+                            self.error = Some(format!("virtual microphone: {e}").into());
+                        }
+                    }
+                }
                 self.push_desk_settings();
                 // The addresses to read out are only interesting now, and an
                 // interface may have come up since the window opened.
@@ -566,6 +577,27 @@ impl LanMic {
             .copied()
             .unwrap_or(PACKET_SIZES[0]);
         self.options.mic.frames_per_packet = next.max(MIN_FRAMES_PER_PACKET);
+    }
+
+    /// Turns the virtual microphone on or off. Live, unlike the jitter target
+    /// and the packet size: this one is switched mid-session by definition,
+    /// because what it is for is the moment somebody starts a call.
+    pub(super) fn toggle_virtual_mic(&mut self) {
+        let Some(server) = self.server.as_mut() else {
+            // Nothing to carry: the tap is filled by the output callback, and
+            // without a mixer there is no output callback.
+            self.error =
+                Some("start the mixer first: the virtual microphone carries its mix".into());
+            return;
+        };
+        let want = server.virtual_mic().is_none();
+        match server.set_virtual_mic(want) {
+            Ok(()) => {
+                self.options.server.virtual_mic = want;
+                self.error = None;
+            }
+            Err(e) => self.error = Some(e.to_string().into()),
+        }
     }
 
     pub(super) fn choose_device(&mut self, direction: Direction, name: String) {

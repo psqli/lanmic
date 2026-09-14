@@ -85,6 +85,7 @@ pub extern "system" fn Java_com_lanmic_audio_NativeAudio_nativeStartTransmitter<
     port: jint,
     frames_per_packet: jint,
     input_preset: jint,
+    device_id: jint,
 ) -> jboolean {
     init_logging();
     let host = rust_string(&mut env, &host);
@@ -104,7 +105,13 @@ pub extern "system" fn Java_com_lanmic_audio_NativeAudio_nativeStartTransmitter<
     // engines must never hold the microphone at once.
     *engine = None;
 
-    match Transmitter::start(&host, port, frames_per_packet.max(0) as usize, input_preset) {
+    match Transmitter::start(
+        &host,
+        port,
+        frames_per_packet.max(0) as usize,
+        input_preset,
+        device_id,
+    ) {
         Ok(t) => {
             *engine = Some(t);
             JNI_TRUE
@@ -191,6 +198,7 @@ pub extern "system" fn Java_com_lanmic_audio_NativeAudio_nativeStartServer(
     _this: JObject,
     port: jint,
     jitter_ms: jint,
+    device_id: jint,
 ) -> jboolean {
     init_logging();
     let port = match validate_port(port) {
@@ -208,7 +216,7 @@ pub extern "system" fn Java_com_lanmic_audio_NativeAudio_nativeStartServer(
     // Drop the old one before binding: it still holds the port.
     *engine = None;
 
-    match Receiver::start(port, jitter_ms) {
+    match Receiver::start(port, jitter_ms, device_id) {
         Ok(r) => {
             *engine = Some(r);
             JNI_TRUE

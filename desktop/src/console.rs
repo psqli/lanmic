@@ -15,6 +15,7 @@ use crate::args::Options;
 use crate::audio::{self, Direction};
 use crate::discovery;
 use crate::engine::{Microphone, Server};
+use crate::virtualmic::Stats;
 
 const REFRESH: Duration = Duration::from_millis(250);
 const BAR_WIDTH: usize = 20;
@@ -88,7 +89,7 @@ pub fn list_devices() {
 }
 
 pub fn run_server(options: &Options) -> io::Result<()> {
-    let server = Server::start(&options.server)?;
+    let mut server = Server::start(&options.server)?;
     catch_interrupts();
 
     println!(
@@ -107,6 +108,18 @@ pub fn run_server(options: &Options) -> io::Result<()> {
             addresses.join(", ")
         }
     );
+    if options.server.virtual_mic {
+        // Not fatal, and deliberately: the mixer is what the room is waiting
+        // for. Somebody who asked for a microphone that could not be made needs
+        // to be told loudly, not have the PA stay silent over it.
+        match server.set_virtual_mic(true) {
+            Ok(()) => println!(
+                "virtual microphone '{}': other programs on this machine can open it as an input",
+                options.server.virtual_mic_name
+            ),
+            Err(e) => eprintln!("virtual microphone unavailable: {e}"),
+        }
+    }
     println!("Ctrl-C to stop.");
 
     let mut sources = Vec::new();
@@ -116,13 +129,14 @@ pub fn run_server(options: &Options) -> io::Result<()> {
         sources.sort_by_key(|s| s.ssrc);
         let strips: Vec<String> = sources.iter().map(strip).collect();
         print!(
-            "\r\x1b[K sources:{} pkts:{} bad:{} lim:{:.2} xrun:{} out:{:.1}ms{}{}",
+            "\r\x1b[K sources:{} pkts:{} bad:{} lim:{:.2} xrun:{} out:{:.1}ms{}{}{}",
             stats.active_sources,
             stats.packets,
             stats.bad_packets,
             stats.limiter_gain,
             stats.xruns,
             stats.latency_ms,
+            virtual_mic(&server),
             if strips.is_empty() { "" } else { "  |  " },
             strips.join("  |  ")
         );
@@ -131,6 +145,25 @@ pub fn run_server(options: &Options) -> io::Result<()> {
     }
     println!();
     Ok(())
+}
+
+/// The virtual microphone's corner of the status line, and nothing at all when
+/// there is not one. `drop` is what matters here: it is the count of mix that
+/// never reached the source, and anything but zero is audible on the far end.
+fn virtual_mic(server: &Server) -> String {
+    match server.virtual_mic() {
+        None => String::new(),
+        Some(mic) => {
+            let stats = mic.stats();
+            format!(
+                "  vmic:{} in:{:.0}s out:{:.0}s drop:{}",
+                if stats.alive() { "on" } else { "stopped" },
+                Stats::seconds(stats.frames_in()),
+                Stats::seconds(stats.frames_out()),
+                stats.frames_dropped()
+            )
+        }
+    }
 }
 
 pub fn run_mic(options: &Options) -> io::Result<()> {

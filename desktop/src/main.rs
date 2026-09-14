@@ -13,6 +13,7 @@
 //!   src/engine.rs     the two sessions and the threads around them
 //!   src/discovery.rs  DISCOVER / ANNOUNCE, both halves
 //!   src/console.rs    --headless, for a machine with no screen
+//!   src/virtualmic.rs the mix as a microphone other programs can open
 //!   src/ui/           the GPUI window
 //! ```
 
@@ -22,6 +23,7 @@ mod console;
 mod discovery;
 mod engine;
 mod ui;
+mod virtualmic;
 
 use std::process::ExitCode;
 

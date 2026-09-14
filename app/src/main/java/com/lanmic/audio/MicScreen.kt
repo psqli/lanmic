@@ -23,6 +23,7 @@ import androidx.compose.material3.Slider
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
@@ -57,6 +58,8 @@ fun MicScreen(settings: Settings) {
     var port by remember { mutableStateOf(settings.port.toString()) }
     var packetFrames by remember { mutableIntStateOf(settings.packetFrames) }
     var preset by remember { mutableIntStateOf(settings.inputPreset) }
+    var device by remember { mutableStateOf(settings.inputDevice) }
+    var inputs by remember { mutableStateOf(AudioDevices.inputs(ctx)) }
     var gain by remember { mutableFloatStateOf(settings.txGain) }
     var muted by remember { mutableStateOf(false) }
     var scanning by remember { mutableStateOf(false) }
@@ -65,8 +68,16 @@ fun MicScreen(settings: Settings) {
 
     fun portOrDefault() = port.toPortOrNull() ?: NativeAudio.DEFAULT_PORT
 
-    fun goLive() =
-        AudioService.startTransmitter(ctx, host.trim(), portOrDefault(), packetFrames, preset)
+    fun goLive() = AudioService.startTransmitter(
+        ctx, host.trim(), portOrDefault(), packetFrames, preset, device
+    )
+
+    // Plugging an interface in while the menu is on screen should put it in the
+    // menu, not wait for the next visit.
+    DisposableEffect(Unit) {
+        val watcher = AudioDevices.watch(ctx) { inputs = AudioDevices.inputs(ctx) }
+        onDispose { AudioDevices.unwatch(ctx, watcher) }
+    }
 
     fun hasMicPermission() = ContextCompat.checkSelfPermission(
         ctx, Manifest.permission.RECORD_AUDIO
@@ -151,6 +162,22 @@ fun MicScreen(settings: Settings) {
     Spacer(Modifier.height(12.dp))
 
     Panel("Capture") {
+        Text("Input", fontSize = 12.sp, color = Palette.TextMuted)
+        Spacer(Modifier.height(6.dp))
+        DevicePicker(
+            endpoints = inputs,
+            selectedKey = device,
+            enabled = !stats.running,
+            onSelect = { device = it; settings.inputDevice = it }
+        )
+        Spacer(Modifier.height(6.dp))
+        Text(
+            "Bluetooth is deliberately not offered: SCO and A2DP both cost more " +
+                "delay than this whole app's budget. Takes effect on start.",
+            fontSize = 11.sp,
+            color = Palette.TextFaint
+        )
+        Spacer(Modifier.height(12.dp))
         Text("Packet size", fontSize = 12.sp, color = Palette.TextMuted)
         Spacer(Modifier.height(6.dp))
         SingleChoiceSegmentedButtonRow(Modifier.fillMaxWidth()) {

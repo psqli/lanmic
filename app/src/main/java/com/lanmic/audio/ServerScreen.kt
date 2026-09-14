@@ -18,6 +18,7 @@ import androidx.compose.material3.Slider
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
@@ -53,6 +54,14 @@ fun ServerScreen(settings: Settings) {
     var stats by remember { mutableStateOf(RxStats()) }
     var sources by remember { mutableStateOf<List<SourceInfo>>(emptyList()) }
     var addresses by remember { mutableStateOf<List<String>>(emptyList()) }
+    var device by remember { mutableStateOf(settings.outputDevice) }
+    var outputs by remember { mutableStateOf(AudioDevices.outputs(ctx)) }
+
+    // A USB interface plugged in while the menu is on screen belongs in it.
+    DisposableEffect(Unit) {
+        val watcher = AudioDevices.watch(ctx) { outputs = AudioDevices.outputs(ctx) }
+        onDispose { AudioDevices.unwatch(ctx, watcher) }
+    }
 
     // Re-read rather than snapshot at composition: the operator moves between
     // access points, and an address that is no longer on the phone is worse
@@ -140,6 +149,26 @@ fun ServerScreen(settings: Settings) {
 
     Spacer(Modifier.height(12.dp))
 
+    Panel("Output") {
+        DevicePicker(
+            endpoints = outputs,
+            selectedKey = device,
+            enabled = !stats.running,
+            onSelect = { device = it; settings.outputDevice = it }
+        )
+        Spacer(Modifier.height(6.dp))
+        Text(
+            "Where the mix plays. A USB interface into the PA beats the phone's " +
+                "own speaker for everything except finding out whether it works. " +
+                "Bluetooth is not offered - it costs more delay than the whole " +
+                "budget. Takes effect on start.",
+            fontSize = 11.sp,
+            color = Palette.TextFaint
+        )
+    }
+
+    Spacer(Modifier.height(12.dp))
+
     Panel("Feedback") {
         Text(
             if (feedbackShift < 0.05f) {
@@ -203,7 +232,11 @@ fun ServerScreen(settings: Settings) {
                 AudioService.stop(ctx)
             } else {
                 AudioService.startServer(
-                    ctx, port.toPortOrNull() ?: NativeAudio.DEFAULT_PORT, jitterMs, Build.MODEL
+                    ctx,
+                    port.toPortOrNull() ?: NativeAudio.DEFAULT_PORT,
+                    jitterMs,
+                    Build.MODEL,
+                    device
                 )
             }
         },

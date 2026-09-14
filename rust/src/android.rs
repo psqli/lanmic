@@ -29,6 +29,19 @@ use crate::util;
 /// How long the sender thread sleeps if the audio callback never wakes it.
 const SENDER_PARK: Duration = Duration::from_millis(100);
 
+/// Oboe's `kUnspecified`: route this stream wherever Android would have routed
+/// it anyway. Every device id that is not a real `AudioDeviceInfo.getId()` -
+/// nothing chosen, a negative number off the JNI boundary, a device that has
+/// been unplugged - collapses to this.
+pub const DEVICE_UNSPECIFIED: i32 = 0;
+
+/// A device id as it may be handed to Oboe. Ids are positive; anything else
+/// means "unspecified", and asking for a negative one is a bug on the Kotlin
+/// side rather than something the engine should pass down.
+fn device_or_default(device_id: i32) -> i32 {
+    device_id.max(DEVICE_UNSPECIFIED)
+}
+
 fn oboe_err(what: &str, e: OboeError) -> io::Error {
     io::Error::other(format!("{what}: {e:?}"))
 }
@@ -131,8 +144,18 @@ impl AudioInputCallback for InputCallback {
 type OutputStream = AudioStreamAsync<Output, OutputCallback>;
 type InputStream = AudioStreamAsync<Input, InputCallback>;
 
-fn open_output(shared: &Arc<RxShared>, mixer: &Arc<Mutex<Mixer>>) -> io::Result<OutputStream> {
+/// `device_id` is an `AudioDeviceInfo.getId()` from the Java side, or
+/// [`DEVICE_UNSPECIFIED`] to let Android route the stream itself. A device that
+/// has been unplugged since the menu was drawn makes the open fail, which the
+/// supervisor treats as any other failed open: it retries, and the next one
+/// lands on whatever is there.
+fn open_output(
+    shared: &Arc<RxShared>,
+    mixer: &Arc<Mutex<Mixer>>,
+    device_id: i32,
+) -> io::Result<OutputStream> {
     let mut stream = AudioStreamBuilder::default()
+        .set_device_id(device_id)
         .set_performance_mode(PerformanceMode::LowLatency)
         .set_sharing_mode(SharingMode::Exclusive)
         .set_sample_rate(SAMPLE_RATE as i32)
@@ -165,8 +188,10 @@ fn open_input(
     shared: &Arc<TxShared>,
     capture: &Arc<CaptureSide>,
     preset: InputPreset,
+    device_id: i32,
 ) -> io::Result<InputStream> {
     let mut stream = AudioStreamBuilder::default()
+        .set_device_id(device_id)
         .set_performance_mode(PerformanceMode::LowLatency)
         .set_sharing_mode(SharingMode::Exclusive)
         .set_sample_rate(SAMPLE_RATE as i32)
@@ -201,7 +226,8 @@ pub struct Receiver {
 }
 
 impl Receiver {
-    pub fn start(port: u16, jitter_ms: i32) -> io::Result<Self> {
+    pub fn start(port: u16, jitter_ms: i32, device_id: i32) -> io::Result<Self> {
+        let device_id = device_or_default(device_id);
         let shared = Arc::new(RxShared::default());
         shared.reset_for_session();
         let (mut router, mixer, table) = receiver::build(port, jitter_ms, shared.clone())?;
@@ -239,7 +265,7 @@ impl Receiver {
                     supervise(
                         || shared.running.load(Ordering::Acquire),
                         || shared.restart_requested.swap(false, Ordering::AcqRel),
-                        || open_output(&shared, &mixer),
+                        || open_output(&shared, &mixer, device_id),
                         |s: &mut OutputStream| {
                             if let Ok(x) = s.get_xrun_count() {
                                 shared.set_xruns(x.max(0) as u32);
@@ -255,7 +281,7 @@ impl Receiver {
 
         match ready_rx.recv() {
             Ok(Ok(())) => {
-                log::info!("server listening, jitter target {jitter_ms} ms");
+                log::info!("server listening, jitter target {jitter_ms} ms, device {device_id}");
                 Ok(engine)
             }
             Ok(Err(e)) => Err(e),
@@ -301,7 +327,9 @@ impl Transmitter {
         port: u16,
         frames_per_packet: usize,
         input_preset: i32,
+        device_id: i32,
     ) -> io::Result<Self> {
+        let device_id = device_or_default(device_id);
         let shared = Arc::new(TxShared::default());
         shared.reset_for_session();
 
@@ -360,7 +388,7 @@ impl Transmitter {
                     supervise(
                         || shared.running.load(Ordering::Acquire),
                         || shared.restart_requested.swap(false, Ordering::AcqRel),
-                        || open_input(&shared, &capture, preset),
+                        || open_input(&shared, &capture, preset, device_id),
                         |s: &mut InputStream| {
                             if let Ok(x) = s.get_xrun_count() {
                                 shared.set_xruns(x.max(0) as u32);
@@ -376,7 +404,7 @@ impl Transmitter {
 
         match ready_rx.recv() {
             Ok(Ok(())) => {
-                log::info!("transmitter up -> {host}:{port}, ssrc {ssrc:08x}");
+                log::info!("transmitter up -> {host}:{port}, ssrc {ssrc:08x}, device {device_id}");
                 Ok(engine)
             }
             Ok(Err(e)) => Err(e),

@@ -3558,6 +3558,7 @@ dependencies = [
  "lanmic",
  "libc",
  "log",
+ "rtrb",
 ]
 
 [[package]]
